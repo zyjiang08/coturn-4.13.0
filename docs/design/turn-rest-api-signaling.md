@@ -146,6 +146,216 @@ def generate_turn_credentials(user_id: str, secret: str, ttl: int = 3600) -> dic
     return {"username": username, "credential": credential, "ttl": ttl, "expiry": expiry}
 ```
 
+### 2.5 C 示例（OpenSSL，与 coturn 一致）
+
+coturn 内部使用 `HMAC(EVP_sha1(), ...)` + `base64_encode()`（见 `src/apps/uclient/mainuclient.c`、`src/apps/relay/userdb.c`）。独立 C 程序可同样依赖 OpenSSL：
+
+```c
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <openssl/bio.h>
+#include <openssl/buffer.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#define REST_API_SEPARATOR ':'
+
+/* Base64 编码，输出需 free() */
+static char *base64_encode(const unsigned char *data, size_t len) {
+  BIO *b64 = BIO_new(BIO_f_base64());
+  BIO *mem = BIO_new(BIO_s_mem());
+  if (!b64 || !mem) {
+    return NULL;
+  }
+  mem = BIO_push(b64, mem);
+  BIO_set_flags(mem, BIO_FLAGS_BASE64_NO_NL);
+  if (BIO_write(mem, data, (int)len) <= 0) {
+    BIO_free_all(mem);
+    return NULL;
+  }
+  if (BIO_flush(mem) != 1) {
+    BIO_free_all(mem);
+    return NULL;
+  }
+  BUF_MEM *buf = NULL;
+  BIO_get_mem_ptr(mem, &buf);
+  char *out = malloc(buf->length + 1);
+  if (!out) {
+    BIO_free_all(mem);
+    return NULL;
+  }
+  memcpy(out, buf->data, buf->length);
+  out[buf->length] = '\0';
+  BIO_free_all(mem);
+  return out;
+}
+
+/*
+ * 生成 TURN REST API 凭据。
+ * secret  : 与 coturn static-auth-secret 相同
+ * user_id : 业务用户 ID，可为 NULL（仅时间戳）
+ * ttl     : 有效秒数
+ * 返回 0 成功，-1 失败
+ */
+int generate_turn_credentials(const char *user_id, const char *secret, int ttl, char *username,
+                              size_t username_sz, char *credential, size_t credential_sz) {
+  const time_t expiry = time(NULL) + ttl;
+
+  if (user_id && user_id[0]) {
+    snprintf(username, username_sz, "%ld%c%s", (long)expiry, REST_API_SEPARATOR, user_id);
+  } else {
+    snprintf(username, username_sz, "%ld", (long)expiry);
+  }
+
+  unsigned char hmac[EVP_MAX_MD_SIZE];
+  unsigned int hmac_len = 0;
+
+  if (!HMAC(EVP_sha1(), secret, (int)strlen(secret), (unsigned char *)username, strlen(username), hmac,
+            &hmac_len)) {
+    return -1;
+  }
+
+  char *b64 = base64_encode(hmac, hmac_len);
+  if (!b64) {
+    return -1;
+  }
+  strncpy(credential, b64, credential_sz - 1);
+  credential[credential_sz - 1] = '\0';
+  free(b64);
+  return 0;
+}
+
+int main(void) {
+  const char *secret = "logen"; /* 与 coturn --static-auth-secret 一致 */
+  char username[1024] = {0};
+  char credential[256] = {0};
+
+  if (generate_turn_credentials("user-42", secret, 3600, username, sizeof(username), credential,
+                                sizeof(credential)) != 0) {
+    fprintf(stderr, "generate failed\n");
+    return 1;
+  }
+
+  printf("username  : %s\n", username);    /* 例: 1735693200:user-42 */
+  printf("credential: %s\n", credential);  /* Base64(HMAC-SHA1) */
+  return 0;
+}
+```
+
+编译：
+
+```bash
+gcc -o turn_cred turn_cred.c -lssl -lcrypto
+```
+
+### 2.6 C++ 示例（OpenSSL）
+
+```cpp
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <openssl/bio.h>
+#include <openssl/buffer.h>
+
+#include <cstdio>
+#include <cstring>
+#include <ctime>
+#include <string>
+
+static std::string base64_encode(const unsigned char *data, size_t len) {
+  BIO *b64 = BIO_new(BIO_f_base64());
+  BIO *mem = BIO_new(BIO_s_mem());
+  mem = BIO_push(b64, mem);
+  BIO_set_flags(mem, BIO_FLAGS_BASE64_NO_NL);
+  BIO_write(mem, data, static_cast<int>(len));
+  BIO_flush(mem);
+  BUF_MEM *buf = nullptr;
+  BIO_get_mem_ptr(mem, &buf);
+  std::string out(buf->data, buf->length);
+  BIO_free_all(mem);
+  return out;
+}
+
+struct TurnCredentials {
+  std::string username;
+  std::string credential;
+  long expiry;
+  int ttl;
+};
+
+TurnCredentials generate_turn_credentials(const std::string &user_id, const std::string &secret, int ttl = 3600) {
+  const long expiry = static_cast<long>(std::time(nullptr)) + ttl;
+
+  TurnCredentials cred;
+  cred.ttl = ttl;
+  cred.expiry = expiry;
+
+  if (!user_id.empty()) {
+    cred.username = std::to_string(expiry) + ":" + user_id;
+  } else {
+    cred.username = std::to_string(expiry);
+  }
+
+  unsigned char hmac[EVP_MAX_MD_SIZE];
+  unsigned int hmac_len = 0;
+
+  HMAC(EVP_sha1(), secret.data(), static_cast<int>(secret.size()),
+       reinterpret_cast<const unsigned char *>(cred.username.data()), cred.username.size(), hmac, &hmac_len);
+
+  cred.credential = base64_encode(hmac, hmac_len);
+  return cred;
+}
+
+int main() {
+  const std::string secret = "logen";
+  TurnCredentials cred = generate_turn_credentials("user-42", secret, 3600);
+
+  std::printf("username  : %s\n", cred.username.c_str());
+  std::printf("credential: %s\n", cred.credential.c_str());
+
+  // 传给 WebRTC / libwebrtc：
+  // iceServer.username = cred.username;
+  // iceServer.credential = cred.credential;
+  return 0;
+}
+```
+
+编译：
+
+```bash
+g++ -std=c++17 -o turn_cred_cpp turn_cred.cpp -lssl -lcrypto
+```
+
+### 2.7 四种语言对照
+
+| 步骤 | 算法 |
+|------|------|
+| 1 | `expiry = now + ttl` |
+| 2 | `username = expiry + ":" + userId`（userId 可省略） |
+| 3 | `credential = base64( HMAC-SHA1(key=secret, message=username) )` |
+
+```javascript
+// JavaScript（Node.js）— 与 2.3 节相同，一行对照
+const username = `${Math.floor(Date.now()/1000) + ttl}:${userId}`;
+const credential = crypto.createHmac('sha1', secret).update(username).digest('base64');
+```
+
+```python
+# Python — 与 2.4 节相同
+username = f"{int(time.time()) + ttl}:{user_id}"
+credential = base64.b64encode(hmac.new(secret.encode(), username.encode(), 'sha1').digest()).decode()
+```
+
+```c
+// C — 与 2.5 节相同
+snprintf(username, sz, "%ld:%s", (long)(time(NULL) + ttl), user_id);
+HMAC(EVP_sha1(), secret, strlen(secret), (unsigned char *)username, strlen(username), hmac, &hmac_len);
+// credential = base64_encode(hmac, hmac_len)
+```
+
+验证：用任意语言生成的 `username` / `credential` 配合 `turnutils_uclient -u <userId> -W <secret>` 或 WebRTC `iceServers` 连接 coturn，应均能认证成功。
+
 ## 3. 方案 B：本地 Shared Secret 生成凭据
 
 方案 B 中，**客户端或服务端**在本地用与 coturn 相同的 shared secret 和算法（第 2 节）生成凭据，无需调用信令接口。coturn 只校验结果是否正确，不关心凭据由哪一端生成。
@@ -224,7 +434,9 @@ const iceServers = buildIceServers('device-001', 3600);
 
 ### 3.4 客户端本地生成
 
-适用：原生 App（Android / iOS / Electron / 桌面客户端）、内网嵌入式设备、开发联调。
+适用：原生 App（Android / iOS / Electron / 桌面客户端）、内网嵌入式设备、C/C++ 媒体网关、开发联调。
+
+C/C++ 完整实现见 **第 2.5、2.6 节**；JavaScript 见 **第 2.3、2.7 节**。
 
 #### JavaScript（React Native / Electron）
 
@@ -277,6 +489,17 @@ async function generateTurnCredentialsBrowser(userId, secret, ttlSeconds = 3600)
 
   return { username, credential, expiry };
 }
+```
+
+#### C / C++（原生客户端、嵌入式、媒体网关）
+
+见第 **2.5**（C）、**2.6**（C++）节。生成后将 `username` / `credential` 传入 libwebrtc 或 Pion 等 SDK 的 ICE 配置即可：
+
+```c
+char username[1024], credential[256];
+generate_turn_credentials("user-42", "logen", 3600, username, sizeof(username),
+                          credential, sizeof(credential));
+/* 填入 WebRTC IceServer.username / .credential */
 ```
 
 #### Kotlin（Android）
