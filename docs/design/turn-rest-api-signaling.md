@@ -1,6 +1,6 @@
 # TURN REST API 与信令服务器集成设计
 
-本文档描述如何用信令服务器动态生成 TURN 凭据，供 WebRTC 客户端向 coturn 发起请求并完成鉴权。该方案对应 coturn 的 **TURN REST API**（也称 secret-based timed authentication）。
+本文档描述如何用信令服务器动态生成 TURN 凭据，供 WebRTC 客户端向 coturn 发起请求并完成鉴权。该方案对应 coturn 的 **TURN REST API**（也称 secret-based timed authentication）。第 12 节给出 **公网 coturn + 内网全锥型 NAT 服务端 + 移动端** 的组网与访问设计。
 
 ## 1. 整体架构
 
@@ -1484,7 +1484,324 @@ coturn 实现要求 **过期时间**（`now + TTL`），校验条件是 `timesta
 
 能。只要 `static-auth-secret` 相同、算法一致（第 2 节）、username 未过期，服务端或客户端本地生成的凭据都能通过 coturn 校验。参考 `turnutils_uclient -W <secret>`（第 3.5 节）。
 
-## 12. 相关源码与文档
+## 12. 部署拓扑：公网 coturn + 内网全锥型 NAT 服务端 + 移动端
+
+典型场景：
+
+| 组件 | 位置 | 网络特征 |
+|------|------|----------|
+| **coturn** | 公网（有独立公网 IP） | 移动端与内网服务端均可主动访问 |
+| **Server** | 内网 | 出口为**全锥型 NAT**（Full Cone NAT）网关 |
+| **Client** | 移动端（4G/5G/WiFi） | 多为端口限制型或对称型 NAT，往往无法被对端直连 |
+
+目标：移动端 Client 能访问内网 Server（信令 + 媒体），并在 NAT 复杂时通过公网 coturn 中继。
+
+### 12.1 先分清两条通路
+
+WebRTC 系统有两条独立通路，需分别设计：
+
+| 通路 | 协议 | 作用 | 本场景要点 |
+|------|------|------|-----------|
+| **信令面** | HTTPS / WSS | 登录、房间、SDP/ICE 交换、TURN 凭据下发 | 移动端必须能连到信令入口 |
+| **媒体面** | UDP/TCP（SRTP） | 音视频 RTP | 由 ICE 选路，常需 TURN 中继 |
+
+信令不通则无法协商；信令通但 ICE 失败则无声画。两者都要覆盖。
+
+### 12.2 全锥型 NAT 对内网 Server 意味着什么
+
+**全锥型 NAT**（Full Cone / NAT Type 1）：内网主机 `内网IP:端口` 映射到 `公网IP:端口` 后，**任意外网主机**向该公网端口发包，均可转发到内网主机（只要映射存在）。
+
+对内网 Server 的利好：
+
+- 在网关上做 **端口映射（DNAT）** 后，外网可主动连入（信令 HTTPS、媒体 UDP 均可）。
+- Server 主动访问公网 coturn 时，网关会建立映射；全锥型下外网从 coturn 回包通常能穿透（比对称型 NAT 友好）。
+
+局限：
+
+- 映射不会自动出现，需在网关上 **显式配置** 或使用 **TURN 中继** 绕过入站问题。
+- 移动端对称型 NAT 仍可能无法与内网 Server **直连**，即使 Server 侧是全锥型。
+
+### 12.3 推荐总体架构
+
+```mermaid
+flowchart TB
+    subgraph Internet["公网"]
+        TURN["coturn<br/>公网 IP"]
+        SIG_PUB["信令入口<br/>公网域名/IP"]
+    end
+
+    subgraph Mobile["移动端 Client"]
+        APP["App / WebRTC"]
+    end
+
+    subgraph Intranet["内网"]
+        SRVR["Server<br/>信令 + 媒体/SFU"]
+    end
+
+    GW["全锥型 NAT 网关<br/>端口映射"]
+
+    APP -->|"① WSS 信令"| SIG_PUB
+    SIG_PUB -->|"映射 443"| GW
+    GW --> SRVR
+
+    APP -->|"② TURN/STUN"| TURN
+    SRVR -->|"③ TURN/STUN"| TURN
+
+    APP -.->|"④ 媒体：常见为经 TURN 中继"| TURN
+    TURN -.-> SRVR
+```
+
+推荐采用 **「公网 coturn 中继媒体 + 信令经 NAT 映射或公网反代」** 组合，而不是假设移动端能直连内网私网地址。
+
+### 12.4 信令面：移动端如何访问内网 Server
+
+内网 Server 本身没有公网 IP，移动端必须通过 **公网可达的信令入口** 与之通信。常见三种做法：
+
+#### 方式 1：全锥型网关端口映射（适合 Server 就在内网）
+
+在 NAT 网关上配置：
+
+```
+公网 IP:443  →  内网 Server:443   （WSS 信令）
+公网 IP:8443 →  内网 Server:8443 （备用）
+```
+
+移动端连接：
+
+```
+wss://signal.example.com/room   →  DNS 指向网关公网 IP
+```
+
+Server 部署信令服务（Node/Go/Java + WebSocket），并提供第 7 节 `GET /api/v1/turn-credentials` 接口。
+
+#### 方式 2：公网反向代理（Nginx/Caddy → 内网 Server）
+
+```
+Mobile --HTTPS/WSS--> 公网 Nginx --内网隧道/专线--> 内网 Server
+```
+
+- 移动端只访问公网域名。
+- Nginx 与内网 Server 之间可走 VPN/专线/内网穿透（frp、WireGuard 等）。
+- TURN 凭据仍由内网 Server（或同域 API 网关）签发。
+
+#### 方式 3：信令放公云，内网 Server 作为参与者注册上线
+
+```
+Mobile --WSS--> 公云信令集群
+内网 Server --WSS 长连接出站--> 公云信令集群（无需公网入站）
+```
+
+- 内网 Server **主动连出** 公网，不依赖端口映射。
+- 适合无法改网关策略的环境。
+- 媒体仍建议走公网 coturn（第 12.5 节）。
+
+| 方式 | 网关改动 | 适用 |
+|------|---------|------|
+| 端口映射 | 需要 | 自有网关、可配 DNAT |
+| 公网反代 | 反代机器在公网 | 已有公网入口 |
+| 公云信令 + Server 出站 | 仅需出站 | 内网严格、不能开入站 |
+
+### 12.5 媒体面：ICE 与 coturn 角色
+
+#### 移动端 Client（几乎总是需要 TURN）
+
+蜂窝网络多为对称型 NAT，外网无法主动连入，**必须**配置公网 coturn：
+
+```javascript
+const pc = new RTCPeerConnection({
+  iceServers: [
+    { urls: 'stun:turn.example.com:3478' },
+    {
+      urls: [
+        'turn:turn.example.com:3478?transport=udp',
+        'turn:turn.example.com:3478?transport=tcp',
+        'turns:turn.example.com:5349?transport=tcp',
+      ],
+      username,   // 信令 API 下发，第 7 节
+      credential,
+    },
+  ],
+  iceTransportPolicy: 'all',  // 调试连通性时可临时改为 'relay'
+});
+```
+
+预期：移动端 ICE 候选中应出现 `typ relay`（经 coturn 中继）。
+
+#### 内网 Server 侧（两种策略）
+
+**策略 A — Server 也走 coturn 中继（推荐，最省事）**
+
+- Server 与移动端一样，向公网 coturn 做 TURN Allocate。
+- 媒体路径：`Mobile ↔ coturn ↔ Server`（两端都经 relay，或一端 relay 一端能直达 coturn）。
+- 不依赖网关上开大量 UDP 端口映射。
+- Server 可用第 3 节方案 B 在本地生成 TURN 凭据（C/C++/JavaScript 均可）。
+
+**策略 B — Server 利用全锥型 NAT 暴露 UDP 端口（省 coturn 带宽）**
+
+在网关上映射 WebRTC 媒体端口段：
+
+```
+公网 IP:50000-50100 UDP  →  内网 Server:50000-50100 UDP
+```
+
+Server ICE 配置中 advertise 公网地址：
+
+```ini
+# Server 进程或 libwebrtc 配置
+# 对外公布 host/srflx 候选时使用网关公网 IP + 映射端口
+public_host=203.0.113.10
+media_port_range=50000-50100
+```
+
+同时仍配置 coturn 作为 fallback。移动端对称 NAT 时最终可能仍只有 relay 路径可用。
+
+#### 媒体路径对照
+
+| 路径 | 条件 | 稳定性 |
+|------|------|--------|
+| Client `relay` ↔ Server `host`（经 coturn 到 Server 公网映射口） | Server 有公网 UDP 映射 | 中 |
+| Client `relay` ↔ Server `relay` | 双方都用 coturn | **高（推荐）** |
+| Client `host/srflx` ↔ Server `host/srflx` | 双方 NAT 均可穿透 | 低（移动端少见） |
+
+### 12.6 公网 coturn 配置要点
+
+coturn 在公网且有独立公网 IP 时，典型配置：
+
+```ini
+listening-port=3478
+tls-listening-port=5349
+
+listening-ip=203.0.113.20
+relay-ip=203.0.113.20
+
+use-auth-secret
+static-auth-secret=<与信令服务器相同>
+
+realm=example.com
+
+min-port=49152
+max-port=65535
+
+fingerprint
+no-multicast-peers
+
+# 移动端 + 内网 Server 的 coturn 流量都指向公网 IP，通常无需 external-ip
+# 若 coturn 本身还在一层 NAT 后面，才需要：
+# external-ip=<公网IP>/<内网IP>
+```
+
+命令行等价：
+
+```bash
+turnserver \
+  --use-auth-secret --static-auth-secret=SECRET \
+  --realm=example.com \
+  -L 203.0.113.20 -E 203.0.113.20 \
+  --min-port=49152 --max-port=65535 \
+  -f
+```
+
+### 12.7 端到端流程（方案 A 信令 + 双端 TURN）
+
+```
+1. Mobile 登录 → 获得 Bearer token
+2. Mobile WSS 连接信令入口（映射/反代/公云，§12.4）
+3. Mobile GET /api/v1/turn-credentials?roomId=xxx
+   → 信令 Server 从 token 取 userId，签发 username/credential
+4. Mobile 创建 RTCPeerConnection(iceServers)，加入房间
+5. 内网 Server 启动时已连信令；本地生成或拉取 TURN 凭据（§3 / §7）
+6. 信令交换 Offer/Answer + ICE candidates
+7. ICE 连通：
+   - Mobile 候选多为 relay（公网 coturn）
+   - Server 候选为 relay 或 映射后的 srflx/host
+8. SRTP 媒体经 coturn 或直达 coturn 回 Server 完成互通
+```
+
+```mermaid
+sequenceDiagram
+    participant M as 移动端 Client
+    participant S as 信令入口
+    participant I as 内网 Server
+    participant T as coturn 公网
+
+    M->>S: WSS 连接 + Bearer token
+    M->>S: GET /turn-credentials?roomId=
+    S->>I: （可选）校验房间成员
+    S-->>M: iceServers + username/credential
+
+    I->>S: WSS 已连接 / 加入房间
+    I->>I: 本地生成 TURN 凭据（方案 B）
+
+    M->>S: Offer + ICE candidates
+    S->>I: 转发
+    I->>S: Answer + ICE candidates
+    S->>M: 转发
+
+    M->>T: TURN Allocate (relay)
+    I->>T: TURN Allocate (relay 或 STUN)
+
+    Note over M,I: 媒体经 T 中继或 T 与 I 映射口互通
+```
+
+### 12.8 内网 Server 参考配置清单
+
+**网络 / 网关**
+
+- [ ] 信令端口映射或公网反代（§12.4）
+- [ ] （可选）媒体 UDP 端口段映射（§12.5 策略 B）
+- [ ] 防火墙允许 Server **出站** 访问 coturn `3478/5349` 与 `49152-65535/udp`
+
+**Server 进程**
+
+- [ ] 信令服务监听内网 `0.0.0.0:443`（WSS）
+- [ ] TURN REST API 或本地 secret 生成（第 7 / 3 节）
+- [ ] WebRTC：`iceServers` 指向公网 coturn 域名（不要用内网私网地址）
+- [ ] libwebrtc / 自研栈：开启 ICE trickle，候选类型日志可抓 `relay`/`srflx`/`host`
+
+**移动端 App**
+
+- [ ] 信令 URL 使用公网域名（非 `192.168.x.x`）
+- [ ] `iceServers` 含 `turn:` 与 `turns:`（第 8 节）
+- [ ] 蜂窝网络下测试 `typ relay` 是否出现
+- [ ] 凭据 TTL ≥ 单次通话时长（第 6 节）
+
+### 12.9 coturn 与配额
+
+公网 coturn 同时服务移动端与内网 Server 时，建议：
+
+```ini
+user-quota=10
+total-quota=5000
+max-bps=0
+```
+
+- `username` 中嵌入稳定 `userId`（第 7.1 节），Mobile 与 Server 各自独立计数。
+- 监控 coturn 带宽；双端 relay 时流量经 coturn 双倍经过，需容量规划。
+
+### 12.10 常见问题
+
+**移动端能 ping 通 coturn 公网 IP，但无 `typ relay` 候选**
+
+- 检查 username/credential 是否过期、secret 是否与 coturn 一致。
+- 检查运营商是否封锁 UDP 3478；改用 `turns:5349?transport=tcp`。
+
+**信令 WSS 能连，媒体不通**
+
+- 信令与媒体独立；重点查 ICE 与 TURN。
+- 内网 Server 是否仍把 `iceServers` 配成内网 STUN 地址。
+- coturn `relay-ip` 是否为公网可达地址。
+
+**Server 在全锥型 NAT 后，是否还需要 TURN？**
+
+- 不强制，但**强烈建议**至少作为 fallback。
+- 移动端对称 NAT 无法直连 Server 映射口时，必须靠 TURN。
+
+**能否让 Mobile 直连内网 Server 私网 IP？**
+
+- 不能（除非 Mobile 与 Server 同一内网或 Mobile 先连 VPN 进内网）。
+- 移动端应只使用公网信令地址 + 公网 coturn。
+
+## 13. 相关源码与文档
 
 | 路径 | 说明 |
 |------|------|
