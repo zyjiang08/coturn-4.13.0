@@ -2258,6 +2258,7 @@ dig +short turn.example.com
 | 内网 **无需公网入站** | Server 仅 **出站 WSS** 注册到 VPS |
 | 部署 **尽量简单** | VPS：coturn + 信令 + Caddy（TLS）；内网：业务 + Agent 客户端 |
 | 复杂 NAT 下媒体可达 | 双端 TURN relay（§12.5 策略 A） |
+| **首帧 / 建连速度** | Server 侧 **Warm PC + TURN 预分配**；心跳刷新候选并缓存到 VPS（§13.10） |
 
 **刻意不使用的组件**
 
@@ -2362,19 +2363,46 @@ VPS 校验 `AGENT_TOKEN`（预共享或 JWT），成功后：
 { "type": "registered", "deviceId": "device-001", "ts": 1735689600 }
 ```
 
-之后每 **30s** 发送心跳：
+之后每 **30s** 发送心跳（**可附带 ICE 候选缓存**，见 §13.10）：
 
 ```json
-{ "type": "ping", "deviceId": "device-001" }
+{
+  "type": "ping",
+  "deviceId": "device-001",
+  "iceCache": {
+    "generation": 7,
+    "gatheredAt": 1735689630,
+    "expiresAt": 1735693230,
+    "candidates": [
+      {
+        "candidate": "candidate:842163050 1 udp 41885440 203.0.113.10 49162 typ relay raddr 0.0.0.0 rport 0 generation 0",
+        "sdpMid": "0",
+        "sdpMLineIndex": 0
+      }
+    ]
+  }
+}
 ```
+
+`iceCache` 为 **可选**；无预生成完成时可省略。VPS 收到后更新 `deviceId` 对应的候选缓存，供后续 `join` 立即下发给 Mobile。
 
 VPS 回复：
 
 ```json
-{ "type": "pong", "ts": 1735689630 }
+{ "type": "pong", "ts": 1735689630, "iceCacheAck": { "generation": 7 } }
 ```
 
-**断线重连**：指数退避 `1s → 2s → 4s → … → 60s`；重连后重新 `register`。
+也可由 Agent 主动推送（不必等 ping）：
+
+```json
+{
+  "type": "ice-cache-update",
+  "deviceId": "device-001",
+  "iceCache": { "generation": 8, "gatheredAt": 1735689700, "expiresAt": 1735693300, "candidates": [ "..."] }
+}
+```
+
+**断线重连**：指数退避 `1s → 2s → 4s → … → 60s`；重连后重新 `register`，并 **立即触发一轮 ICE 预生成**（§13.10.3）。
 
 #### 13.4.3 Mobile 加入房间（Mobile → VPS → Agent）
 
@@ -2415,6 +2443,31 @@ VPS 逻辑：
 { "type": "error", "code": "DEVICE_OFFLINE", "deviceId": "device-001" }
 ```
 
+5. 若 Agent 在线且 VPS 持有 **有效 `iceCache`**，在 `join` 成功 ack 中 **立即附带 Server 预生成候选**（Mobile 可并行 `addIceCandidate`，不必等 Server 处理 offer）：
+
+```json
+{
+  "type": "joined",
+  "roomId": "room-abc",
+  "targetDeviceId": "device-001",
+  "serverIceCache": {
+    "generation": 7,
+    "candidates": [ { "candidate": "...", "sdpMid": "0", "sdpMLineIndex": 0 } ]
+  }
+}
+```
+
+#### 13.4.5 连接状态模型（VPS 内存）
+
+```
+agents: Map<deviceId, AgentConnection>
+clients: Map<relayId, ClientConnection>   // relayId 由 join 分配
+rooms: Map<roomId, { clientRelayId, deviceId }>
+iceCache: Map<deviceId, { generation, gatheredAt, expiresAt, candidates[] }>
+```
+
+Agent 断开 → 清理 `agents` 与 `iceCache` 中条目，向相关 Mobile 推送 `DEVICE_OFFLINE`。
+
 #### 13.4.4 WebRTC 信令转发
 
 Mobile 与内网 Server 之间的 SDP / ICE **原样经 VPS 中转**，消息统一格式：
@@ -2444,16 +2497,6 @@ Mobile 与内网 Server 之间的 SDP / ICE **原样经 VPS 中转**，消息统
 ```
 
 VPS **不解析** SDP 内容，只做路由（`targetDeviceId` → Agent 或 Mobile 连接）。
-
-#### 13.4.5 连接状态模型（VPS 内存）
-
-```
-agents: Map<deviceId, AgentConnection>
-clients: Map<relayId, ClientConnection>   // relayId 由 join 分配
-rooms: Map<roomId, { clientRelayId, deviceId }>
-```
-
-Agent 断开 → 清理 `agents` 中条目，向相关 Mobile 推送 `DEVICE_OFFLINE`。
 
 ### 13.5 安全设计
 
@@ -2641,10 +2684,10 @@ function connect() {
   ws.on('open', () => {
     backoff = 1000;
     ws.send(JSON.stringify({ type: 'register', deviceId: DEVICE_ID, token: AGENT_TOKEN }));
-    setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'ping', deviceId: DEVICE_ID }));
-      }
+    setInterval(async () => {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      const iceCache = await require('./warm-pc').buildIceCachePayload();
+      ws.send(JSON.stringify({ type: 'ping', deviceId: DEVICE_ID, ...(iceCache && { iceCache }) }));
     }, 30000);
   });
 
@@ -2710,7 +2753,7 @@ function turnCredentials(userId, ttl = 3600) {
 }
 ```
 
-收到 Mobile 的 `offer` 后，内网 Server 创建 PeerConnection（`iceServers` 如上），生成 `answer` 经 Agent **回传 VPS → Mobile**。
+收到 Mobile 的 `offer` 后，内网 Server **优先复用 Warm PC**（§13.10）生成 `answer`；若无可用 Warm PC 则冷启动建连。Answer 经 Agent **回传 VPS → Mobile**。
 
 #### 步骤 4：内网防火墙
 
@@ -2742,45 +2785,84 @@ export const CONFIG = {
 };
 ```
 
-#### 步骤 2：登录 → 取 TURN 凭据 → 连 WSS
+#### 步骤 2：登录 → 取 TURN 凭据 → 连 WSS（并行 + 预填 Server 候选）
+
+为缩短建连时间，Mobile 侧应 **并行** 发起：REST 取凭据、WSS 连接、创建 `RTCPeerConnection` 并开始本地 ICE gathering（§13.10.5）。收到 `joined` 中的 `serverIceCache` 后 **立即** `addIceCandidate`，不必等 Server answer。
 
 ```javascript
 async function prepareCall(roomId, targetDeviceId, userJwt) {
-  const credRes = await fetch(
+  // 并行：凭据 + WebSocket
+  const credP = fetch(
     `${CONFIG.apiBase}/turn-credentials?roomId=${encodeURIComponent(roomId)}`,
     { headers: { Authorization: `Bearer ${userJwt}` } }
-  );
-  const { iceServers } = await credRes.json();
+  ).then((r) => r.json());
 
-  const pc = new RTCPeerConnection({ iceServers });
-
-  const ws = new WebSocket(CONFIG.signalWs, {
-    headers: { Authorization: `Bearer ${userJwt}` },
+  const wsP = new Promise((resolve, reject) => {
+    const ws = new WebSocket(CONFIG.signalWs, {
+      headers: { Authorization: `Bearer ${userJwt}` },
+    });
+    ws.onopen = () => resolve(ws);
+    ws.onerror = reject;
   });
 
-  ws.onopen = () => {
-    ws.send(JSON.stringify({ type: 'join', roomId, targetDeviceId }));
-  };
+  const [{ iceServers }, ws] = await Promise.all([credP, wsP]);
+  const pc = new RTCPeerConnection({ iceServers });
+
+  // 并行：Mobile 本地 ICE gathering（与 join 同时进行）
+  const localCandidatesP = gatherLocalCandidates(pc);
+
+  ws.send(JSON.stringify({ type: 'join', roomId, targetDeviceId }));
 
   ws.onmessage = async (ev) => {
     const msg = JSON.parse(ev.data);
+
+    // join ack：立即注入 Server 预生成候选
+    if (msg.type === 'joined' && msg.serverIceCache?.candidates) {
+      for (const c of msg.serverIceCache.candidates) {
+        await pc.addIceCandidate(c).catch(() => {});
+      }
+    }
+
     if (msg.type === 'signal') {
       const { kind, sdp, candidate } = msg.payload;
-      if (kind === 'offer') {
-        await pc.setRemoteDescription({ type: 'offer', sdp });
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        ws.send(JSON.stringify({
-          type: 'signal', roomId, targetDeviceId,
-          payload: { kind: 'answer', sdp: answer.sdp },
-        }));
+      if (kind === 'answer') {
+        await pc.setRemoteDescription({ type: 'answer', sdp });
       } else if (kind === 'ice-candidate' && candidate) {
         await pc.addIceCandidate(candidate);
       }
     }
   };
 
+  // Mobile 作 Offerer：join 完成后尽快发 offer
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  ws.send(JSON.stringify({
+    type: 'signal', roomId, targetDeviceId,
+    payload: { kind: 'offer', sdp: offer.sdp },
+  }));
+
+  // trickle 本地候选
+  localCandidatesP.then((locals) => {
+    for (const c of locals) {
+      ws.send(JSON.stringify({
+        type: 'signal', roomId, targetDeviceId,
+        payload: { kind: 'ice-candidate', candidate: c },
+      }));
+    }
+  });
+
   return { pc, ws };
+}
+
+function gatherLocalCandidates(pc) {
+  return new Promise((resolve) => {
+    const buf = [];
+    pc.onicecandidate = (e) => {
+      if (e.candidate) buf.push(e.candidate.toJSON());
+      else resolve(buf);
+    };
+    pc.createDataChannel('probe'); // 触发 gathering
+  });
 }
 ```
 
@@ -2815,6 +2897,7 @@ const ALLOWED = new Set((process.env.ALLOWED_DEVICES || '').split(',').filter(Bo
 
 const agents = new Map();   // deviceId -> ws
 const clients = new Map();  // ws -> { userId, roomId, targetDeviceId }
+const iceCache = new Map(); // deviceId -> iceCache（§13.10.4）
 
 const app = express();
 app.get('/api/v1/health', (_, res) => res.json({ ok: true }));
@@ -2853,7 +2936,12 @@ function onAgent(ws) {
       return;
     }
     if (msg.type === 'ping') {
-      ws.send(JSON.stringify({ type: 'pong', ts: Date.now() }));
+      if (msg.iceCache) upsertIceCache(deviceId, msg.iceCache);
+      ws.send(JSON.stringify({ type: 'pong', ts: Date.now(), iceCacheAck: msg.iceCache ? { generation: msg.iceCache.generation } : undefined }));
+      return;
+    }
+    if (msg.type === 'ice-cache-update') {
+      upsertIceCache(deviceId, msg.iceCache);
       return;
     }
     // Agent → Mobile 转发
@@ -2865,7 +2953,19 @@ function onAgent(ws) {
       }
     }
   });
-  ws.on('close', () => { if (deviceId) agents.delete(deviceId); });
+  ws.on('close', () => { if (deviceId) { agents.delete(deviceId); iceCache.delete(deviceId); } });
+}
+
+function upsertIceCache(deviceId, cache) {
+  if (!cache?.candidates?.length) return;
+  iceCache.set(deviceId, cache);
+}
+
+function getValidIceCache(deviceId) {
+  const c = iceCache.get(deviceId);
+  if (!c) return null;
+  if (Date.now() / 1000 >= c.expiresAt - 30) { iceCache.delete(deviceId); return null; }
+  return c;
 }
 
 function onClient(ws, req) {
@@ -2882,6 +2982,13 @@ function onClient(ws, req) {
         return;
       }
       clients.set(ws, { userId, roomId: msg.roomId, targetDeviceId: msg.targetDeviceId });
+      const cache = getValidIceCache(msg.targetDeviceId);
+      ws.send(JSON.stringify({
+        type: 'joined',
+        roomId: msg.roomId,
+        targetDeviceId: msg.targetDeviceId,
+        ...(cache && { serverIceCache: { generation: cache.generation, candidates: cache.candidates } }),
+      }));
       agent.send(JSON.stringify({
         type: 'join', roomId: msg.roomId, clientUserId: userId, relayId: crypto.randomUUID(),
       }));
@@ -2922,7 +3029,236 @@ function buildIceServers(username, credential) {
 server.listen(PORT, '127.0.0.1', () => console.log(`signal-hub on ${PORT}`));
 ```
 
-### 13.10 端到端通话时序
+### 13.10 连接加速：Server 候选预生成与缓存
+
+Mobile 拨入内网 Server 时，端到端建连耗时主要来自 **TURN Allocate** 与 **ICE gathering**（尤其是 `typ relay`）。若等到 `join` 或收到 `offer` 后才在 Server 侧创建 `PeerConnection`， callee 通常额外增加 **300ms～2s+**。
+
+**优化思路**：内网 Server 在 **空闲期**（注册成功 ~ 下次通话前）维护 **Warm PeerConnection**，提前完成 TURN 分配与 relay 候选收集；经 **心跳** 刷新 allocation 并将候选 **缓存到 VPS**；Mobile `join` 时 **立即** 拿到 Server 候选并并行建连。
+
+#### 13.10.1 延迟分解（冷启动 baseline）
+
+| 阶段 | 典型耗时 | 说明 |
+|------|---------|------|
+| Mobile REST 取凭据 | 50～200ms | HTTPS RTT |
+| Mobile WSS join | 50～150ms | 取决于网络 |
+| Mobile TURN Allocate + relay gathering | 200～800ms | 常并行 |
+| **Server 冷启动 PC + TURN** | **300～1500ms** | **可省掉的主因** |
+| Offer/Answer 交换 | 50～200ms | 信令 RTT |
+| ICE connectivity checks | 100～500ms | 双端已有 relay 时偏下限 |
+| **合计（冷启动 Server）** | **~1～3s** | 视网络与运营商而定 |
+
+预热后目标：Server 侧 TURN + relay gathering **移出通话关键路径**，首包 ICE 检查可提前开始。
+
+#### 13.10.2 三层预热模型
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ L1 — Warm PeerConnection（内网 Server 进程内）                  │
+│   • register 成功后立即创建 idle PC + iceServers               │
+│   • 等待 typ relay 候选齐全                                    │
+│   • 通话到来：复用该 PC 作 Answerer（setRemote(offer)→answer） │
+│   • 通话结束：销毁并重建下一套 Warm PC                          │
+├─────────────────────────────────────────────────────────────┤
+│ L2 — TURN Allocation 保活                                      │
+│   • coturn 默认 allocation lifetime ≤ 3600s（§6.2）            │
+│   • 心跳周期（30s）内对 Warm PC 做 ICE restart 或 Refresh      │
+│   • TURN 凭据 expiry 前 5min 用新 username 重建 Warm PC         │
+├─────────────────────────────────────────────────────────────┤
+│ L3 — VPS iceCache（信令 Hub 内存）                              │
+│   • Agent ping / ice-cache-update 上传 candidates + generation│
+│   • Mobile join → joined.serverIceCache 立即下发               │
+│   • expiresAt 过期或 Agent 离线 → 缓存失效                      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 13.10.3 内网 Server：Warm PC 生命周期
+
+**触发预生成**
+
+| 事件 | 动作 |
+|------|------|
+| Agent `register` 成功 | 创建 Warm PC，开始 gathering |
+| 每 30s `ping` | 检查 PC 状态；若 `relay` 已就绪则附带 `iceCache` 上传 |
+| TURN 凭据剩余 < 5min | 销毁旧 PC，用新凭据重建并 re-gather |
+| Warm PC `failed` / `closed` | 立即重建 |
+| Agent WSS 重连 | 清空 generation，强制 re-gather（网关 WAN 可能已变） |
+| 一次通话结束 | 销毁会话 PC，**异步**重建 Warm PC |
+
+**Warm PC 配置建议**
+
+```javascript
+// warm-pc.js — 内网 Server
+const WARM_DEVICE_USER = 'device-001'; // 与 TURN quota 对应，§7.1
+
+let warm = { pc: null, generation: 0, candidates: [], expiresAt: 0 };
+
+async function ensureWarmPc() {
+  if (warm.pc && warm.pc.connectionState !== 'closed' && Date.now() / 1000 < warm.expiresAt - 60) {
+    return warm;
+  }
+  if (warm.pc) warm.pc.close();
+
+  const { iceServers, expiry } = turnCredentials(WARM_DEVICE_USER, 3600);
+  const pc = new RTCPeerConnection({ iceServers, iceTransportPolicy: 'relay' });
+  pc.createDataChannel('warm'); // 触发 gathering，无需真实媒体
+
+  const candidates = await waitRelayCandidates(pc);
+  warm = {
+    pc,
+    generation: ++warm.generation,
+    candidates,
+    expiresAt: expiry,
+    gatheredAt: Math.floor(Date.now() / 1000),
+  };
+  return warm;
+}
+
+function waitRelayCandidates(pc, timeoutMs = 8000) {
+  return new Promise((resolve) => {
+    const buf = [];
+    const t = setTimeout(() => resolve(buf), timeoutMs);
+    pc.onicecandidate = (e) => {
+      if (e.candidate?.candidate?.includes('typ relay')) {
+        buf.push(e.candidate.toJSON());
+      }
+      if (!e.candidate) { clearTimeout(t); resolve(buf); }
+    };
+  });
+}
+
+// 心跳时调用：返回 iceCache 供 Agent 填入 ping
+async function buildIceCachePayload() {
+  const w = await ensureWarmPc();
+  if (!w.candidates.length) return null;
+  return {
+    generation: w.generation,
+    gatheredAt: w.gatheredAt,
+    expiresAt: w.expiresAt,
+    candidates: w.candidates,
+  };
+}
+
+// 来电：复用 Warm PC 快速 answer
+async function handleOffer(offerSdp) {
+  const w = await ensureWarmPc();
+  const pc = w.pc;
+  await pc.setRemoteDescription({ type: 'offer', sdp: offerSdp });
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+  // 本会话占用 warm.pc；answer 发出后 warm.pc = null，通话结束再 ensureWarmPc()
+  warm.pc = null;
+  return { sdp: answer.sdp, generation: w.generation };
+}
+```
+
+`iceTransportPolicy: 'relay'` 在 Warm 阶段可 **只收集 relay**，缩短 gathering 时间；生产环境也可保持 `all`，由 ICE 优选。
+
+**注意**：预缓存的 candidate 来自 **当前 Warm allocation**。Mobile 收到后应用 `addIceCandidate` 做 trickle；最终 ICE 仍以 Answer SDP 内候选为准。若 `generation` 与 Answer 不一致，忽略旧 cache，以 Answer / 后续 trickle 为准。
+
+#### 13.10.4 VPS：iceCache 存储与 join 下发
+
+```javascript
+// signal-hub 内存结构
+const iceCache = new Map(); // deviceId -> { generation, gatheredAt, expiresAt, candidates }
+
+function upsertIceCache(deviceId, cache) {
+  if (!cache?.candidates?.length) return;
+  iceCache.set(deviceId, cache);
+}
+
+function getValidIceCache(deviceId) {
+  const c = iceCache.get(deviceId);
+  if (!c) return null;
+  if (Date.now() / 1000 >= c.expiresAt - 30) { iceCache.delete(deviceId); return null; }
+  return c;
+}
+
+// onAgent ping / ice-cache-update → upsertIceCache(deviceId, msg.iceCache)
+// onClient join 成功 → ws.send({ type: 'joined', serverIceCache: getValidIceCache(deviceId) })
+```
+
+#### 13.10.5 Mobile：并行建连流水线
+
+将串行流程改为并行，与 Server 预热叠加：
+
+```
+时间轴 ──────────────────────────────────────────────────────▶
+
+Mobile:  [ turn-credentials ]────┐
+Mobile:  [ WSS connect      ]────┼──▶ join ──▶ offer ──▶ trickle
+Mobile:  [ create PC + gather ]────┘              ▲
+Mobile:  [ addIceCandidate(serverIceCache) ]──────┘ joined 后立即
+
+Server:  (空闲期) Warm PC + relay 已就绪 ──心跳──▶ VPS iceCache
+Server:  join ──▶ 复用 Warm PC ──▶ answer（跳过 Allocate 等待）
+```
+
+Mobile 侧要点（见 §13.8 更新示例）：
+
+1. `Promise.all([fetchCredentials, connectWs])`  
+2. `createOffer` 与 `join` 尽量并行  
+3. 收到 `joined.serverIceCache` **先于** `answer` 注入候选  
+4. 本地 trickle 与 Server answer trickle 双向并行  
+
+#### 13.10.6 心跳与预生成时序（空闲期）
+
+```mermaid
+sequenceDiagram
+    participant S as 内网 WebRTC
+    participant A as Agent
+    participant V as VPS 信令
+    participant T as coturn
+
+    Note over S,T: === 启动 / 注册后：首次预生成 ===
+    A->>V: register
+    V-->>A: registered
+    S->>S: ensureWarmPc()
+    S->>T: TURN Allocate（Warm PC）
+    T-->>S: relay candidate
+    S->>A: iceCache ready
+    A->>V: ice-cache-update { generation:1, candidates }
+
+    Note over S,T: === 每 30s 心跳：保活 + 刷新缓存 ===
+    loop 每 30s
+        S->>S: 检查 Warm PC / 凭据 expiry
+        alt relay 就绪且未过期
+            A->>V: ping { iceCache }
+            V-->>A: pong { iceCacheAck }
+        else PC 失效或凭据将过期
+            S->>S: 重建 Warm PC
+            S->>T: 新 Allocate
+            A->>V: ice-cache-update { generation:N+1 }
+        end
+    end
+
+    Note over S,T: === Agent 重连（如网关 WAN 变化）===
+    A->>V: register
+    S->>S: 强制重建 Warm PC（旧 generation 作废）
+    A->>V: ice-cache-update { generation:N+2 }
+```
+
+#### 13.10.7 参数建议
+
+| 参数 | 建议值 | 说明 |
+|------|--------|------|
+| 心跳间隔 | 30s | 与 Agent ping 一致 |
+| iceCache 有效期 | = TURN 凭据 expiry − 30s | VPS 拒绝下发临期候选 |
+| Warm 凭据 TTL | 3600s | 与 Mobile 一致；可缩短提高安全 |
+| 凭据重建阈值 | expiry 前 300s | 避免通话中 allocation 过期 |
+| relay 等待超时 | 8s | 超时告警并下轮心跳重试 |
+| generation | 单调递增 | Mobile/Server 用于丢弃 stale cache |
+
+#### 13.10.8 限制与边界
+
+- **一对一预缓存**：每个 `deviceId` 一套 Warm PC；多路并发通话需池化（`N` 个 Warm PC）或仅对「下一通预期 callee」预热。  
+- **候选与 SDP 一致性**：预缓存 candidate 是 **加速 hint**；Answer 到达后应以 SDP 为准。  
+- **网关 WAN 变化**：Agent 重连后 **必须** 递增 `generation` 并 re-gather；VPS 清旧 cache。  
+- **coturn Refresh**：Warm PC 存活期间 libwebrtc 通常自动 Refresh；长时间 idle 仍应在心跳里检测 `iceConnectionState`。  
+- **security**：`iceCache` 仅随 `join` 发给已 JWT 鉴权的 Mobile；不在公网广播。
+
+### 13.11 建连时序：冷启动 vs 预热
+
+#### 13.11.1 冷启动（未启用 §13.10，baseline）
 
 ```mermaid
 sequenceDiagram
@@ -2932,31 +3268,72 @@ sequenceDiagram
     participant S as 内网 WebRTC
     participant T as coturn
 
-    A->>V: WSS /agent register
-    V-->>A: registered
-
-    M->>V: GET /turn-credentials (JWT)
+    A->>V: register
+    M->>V: GET /turn-credentials
     V-->>M: iceServers
-
-    M->>V: WSS /ws join room
-    V->>A: join (clientUserId)
-    A->>S: 通知新会话
-
-    M->>V: signal offer
-    V->>A: forward offer
-    A->>S: handle offer
-    S->>T: TURN Allocate
-    M->>T: TURN Allocate
-
+    M->>V: join
+    V->>A: join
+    M->>T: TURN Allocate + gather
+    M->>V: offer
+    V->>A: offer
+    A->>S: handleOffer（冷启动 PC）
+    S->>T: TURN Allocate + gather
+    Note over S,T: ⚠ 300ms～1.5s+ 在关键路径上
     S->>A: answer + ICE
     A->>V: signal answer
-    V->>M: forward answer
-
-    M->>T: SRTP relay
-    T->>S: SRTP relay
+    V->>M: answer
+    M->>T: ICE check → SRTP
+    T->>S: SRTP
 ```
 
-### 13.11 运维与排障
+#### 13.11.2 预热（启用 §13.10，推荐）
+
+```mermaid
+sequenceDiagram
+    participant M as Mobile
+    participant V as VPS 信令
+    participant A as 内网 Agent
+    participant S as 内网 WebRTC
+    participant T as coturn
+
+    Note over S,T: 空闲期已完成 Warm PC + iceCache
+
+    par Mobile 并行
+        M->>V: GET /turn-credentials
+        M->>V: WSS connect
+    end
+    V-->>M: iceServers
+    M->>M: create PC + gather（并行）
+    M->>V: join
+    V-->>M: joined + serverIceCache
+    M->>M: addIceCandidate(server) 
+    M->>T: TURN Allocate + gather
+    M->>V: offer
+    V->>A: offer
+    A->>S: handleOffer（复用 Warm PC）
+    Note over S: ✅ 跳过 TURN Allocate 等待
+    S->>A: answer
+    A->>V: signal answer
+    V->>M: answer
+    par ICE 并行
+        M->>T: connectivity checks
+        T->>S: connectivity checks
+    end
+    M->>T: SRTP
+    T->>S: SRTP
+    S->>S: 通话结束 → 重建 Warm PC → ice-cache-update
+```
+
+#### 13.11.3 耗时对比（经验区间）
+
+| 路径 | Server 侧 TURN+gather | 典型首连 ICE 完成 |
+|------|----------------------|------------------|
+| 冷启动 | 在 offer→answer 关键路径内 | ~1～3s |
+| 预热 + 并行 Mobile | 已移出关键路径 | ~0.4～1.2s |
+
+实际以目标网络实测为准；蜂窝 + 双端 relay 偏上限。
+
+### 13.12 运维与排障
 
 | 现象 | 排查 |
 |------|------|
@@ -2966,6 +3343,9 @@ sequenceDiagram
 | 信令通、无媒体 | ICE 日志；双端是否都 Allocate；coturn `relay-ip` |
 | 网关重拨后 Mobile 正常、内网断 | Agent 应自动重连；检查内网出站 443 |
 | 网关重拨后 Agent 正常、Mobile 正常 | 模式 A 下 **信令不受影响**（均连 VPS） |
+| **首连慢 / 无 relay** | Warm PC 是否创建；心跳是否上传 `iceCache`；`joined` 是否带 `serverIceCache` |
+| **joined 有 cache 仍慢** | Mobile 是否并行取凭据 + WSS；是否在 answer 前 `addIceCandidate` |
+| **generation 不一致** | Server 重建 Warm PC 后 Mobile 仍用旧 cache → 以 answer SDP 为准并忽略旧 generation |
 
 **日志建议**
 
@@ -2977,7 +3357,7 @@ sequenceDiagram
 - `TURN_SECRET`、`JWT_SECRET`、`AGENT_TOKEN` 放 `/etc/.../env`，权限 `600`
 - 轮换 `AGENT_TOKEN`：更新 VPS + 内网 env，重启两边服务
 
-### 13.12 部署清单（Checklist）
+### 13.13 部署清单（Checklist）
 
 **VPS**
 
@@ -2985,7 +3365,7 @@ sequenceDiagram
 - [ ] 防火墙：443、3478、5349、49152-65535/udp
 - [ ] coturn：`use-auth-secret`，`relay-ip` = VPS 公网 IP
 - [ ] Caddy：`signal.example.com` → `127.0.0.1:8080`
-- [ ] signal-hub：systemd 运行，health OK
+- [ ] signal-hub：systemd 运行，health OK；支持 `iceCache` / `joined.serverIceCache`（§13.10.4）
 - [ ] `turnutils_uclient -W` 通过
 
 **内网 Server**
@@ -2994,14 +3374,18 @@ sequenceDiagram
 - [ ] 出站 443 / 3478 放行
 - [ ] **无** 443 入站映射、**无** frp、**无** DDNS
 - [ ] WebRTC 使用 `turn.example.com` relay
+- [ ] **Warm PC**：register 后预生成；心跳上传 `iceCache`（§13.10）
+- [ ] Agent 重连后强制 re-gather + 递增 `generation`
 
 **Mobile App**
 
 - [ ] 只配置域名
 - [ ] JWT 登录 + turn-credentials + WSS join 流程通
+- [ ] **并行**凭据 / WSS / PC gathering（§13.10.5）
+- [ ] 处理 `joined.serverIceCache` 预填候选
 - [ ] 蜂窝网 `typ relay` 验证
 
-### 13.13 与 §12 其他模式的关系
+### 13.14 与 §12 其他模式的关系
 
 | 模式 | 何时使用 |
 |------|----------|
