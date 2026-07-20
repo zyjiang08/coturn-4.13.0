@@ -1535,7 +1535,7 @@ WebRTC 系统有两条独立通路，需分别设计：
 
 - 映射不会自动出现，需在网关上 **显式配置** 或使用 **TURN 中继** 绕过入站问题。
 - 移动端对称型 NAT 仍可能无法与内网 Server **直连**，即使 Server 侧是全锥型。
-- **公网 IP 变化**时，静态写死的 `public_host=203.0.113.x` 会立刻失效；必须配合 DDNS + 运行时 STUN 发现，或改用 §12.5 策略 A。
+- **公网 IP 变化**时，静态写死的 `public_host=203.0.113.x` 会立刻失效；若仍需发布 host candidate，应改为在 **使用时** 通过 `IPublicIpResolver` 向 coturn/STUN 动态探测公网映射 IP（不做周期轮询），并要求固定映射端口满足 `50000`；否则直接改用 §12.5 策略 A。
 
 #### 12.2.1 全锥型 NAT 网关配置要点
 
@@ -1865,26 +1865,9 @@ const pc = new RTCPeerConnection({
 WAN:50000-50100 UDP  →  内网 Server:50000-50100 UDP
 ```
 
-**禁止**在配置里写死 `public_host=203.0.113.x`。应通过 STUN 向公网 coturn 查询当前 reflexive 地址，或在 Server 启动时用 HTTP/DNS 探测当前 WAN IP：
+**禁止**在配置里写死 `public_host=203.0.113.x`。CAE 侧若需要对外公布 host candidate，应统一走 `IPublicIpResolver`：在 **transport 初始化/首次使用时** 向 coturn/STUN 动态探测公网映射 IP，结果在当前会话内短缓存复用；不做周期轮询。若探测结果的公网端口不是 `50000`，则不发布公网 host candidate，直接回退到 p2p/srflx 或 TURN relay。
 
-```javascript
-// 示例：用 coturn STUN 获取 Server 当前公网 reflexive 地址（网关 WAN IP）
-const pc = new RTCPeerConnection({
-  iceServers: [{ urls: 'stun:turn.example.com:3478' }],
-});
-pc.createDataChannel('probe');
-pc.createOffer().then((o) => pc.setLocalDescription(o));
-pc.onicecandidate = (e) => {
-  if (!e.candidate) return;
-  const m = e.candidate.candidate.match(/(\d+\.\d+\.\d+\.\d+) (\d+) typ srflx/);
-  if (m) {
-    console.log('current public host:', m[1], 'port:', m[2]);
-    // 写入 SFU / libwebrtc 对外公布的 host 候选
-  }
-};
-```
-
-libwebrtc 若启用 `stun_server`，通常会自动产生 `typ srflx` 候选，无需手工填 `public_host`。IP 变化后需 **ICE restart** 重新收集候选。
+相关设计见：`coturn-4.13.0/docs/design/cae-stun-public-ip-discovery.md`
 
 同时仍配置 coturn 作为 fallback。移动端对称 NAT 时最终可能仍只有 relay 路径可用。
 
