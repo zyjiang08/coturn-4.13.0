@@ -1,7 +1,8 @@
 # CAE 通过 coturn/STUN 动态发现公网 IP 设计
 
-> 日期：2026-07-20
-> 适用范围：`nexartc-cloud-phone-access-engine/` WebRTC server 侧 host candidate 生成
+> 日期：2026-07-20（调度策略 2026-07-21 更新）  
+> 适用范围：`nexartc-cloud-phone-access-engine/` WebRTC server 侧 host candidate 生成  
+> 联调日志路径与四类前缀见 [`nexartc-logging-design.md`](./nexartc-logging-design.md)（CAE：`cae_server_*.log` 搜 `[FLOW] local_ip` / candidate / `public IP`；device：`ICE path`）
 
 ## 1. 背景
 
@@ -23,7 +24,7 @@
 - `webrtc_port_range_begin=50000`
 - `webrtc_port_range_end=50000`
 - `webrtc_public_ip` 默认留空
-- CAE 在启动 WebRTC transport 时，主动向 coturn/STUN 发起 **Binding Request**，动态得到自己的公网映射 IP。
+- CAE 通过独立 STUN 探测任务动态得到自己的公网映射 IP（启动同步一次 + 周期刷新 + 建连失败重探）。
 
 ## 2. 目标
 
@@ -32,7 +33,8 @@
 - 不再依赖 `webrtc_public_ip` 手工静态配置；
 - 继续保持 host 优先；
 - 端口固定为 `50000`，与 `listen_port_h5` 共用同一数字；
-- 若公网映射端口不是 `50000`，则不发送公网 host candidate，自动回退到 p2p/srflx 或 relay。
+- 若公网映射端口不是 `50000`，则不发送公网 host candidate，自动回退到 p2p/srflx 或 relay；
+- 公网 IP 变化（拨号重拨）可在合理时间内自动感知，无需重启 CAE。
 
 ### 2.2 非目标
 
@@ -81,45 +83,67 @@ struct PublicIpResolution {
 
 ### 3.3 调度策略
 
-`IPublicIpResolver` 采用 **按需获取**，不是后台周期轮询：
+由 `WebRtcServerTransport` 内 **独立后台线程**（`cae-pubip`）调度，而不是仅在首次 `Init` 取一次：
 
-- 由 `WebRtcServerTransport` 在初始化 / 新建 PeerConnection 前触发一次；
-- 结果在当前 transport 生命周期内缓存，供后续同一会话复用；
-- 只有当会话重建、缓存失效或探测失败时，才再次触发解析；
-- 不启动独立定时任务，避免无谓 STUN 流量和日志噪声。
+| 触发 | 时机 | reason 日志 |
+|------|------|-------------|
+| 启动同步 | `Init()` 内立刻 `RefreshPublicIp("init")` | `init` |
+| 周期刷新 | `Start()` 后独立线程按间隔等待 | `periodic` |
+| 建连失败 | `PeerConnection` → `Failed` | `ice_failed` |
+| 收集失败 | gathering complete 且本地候选数为 0 | `gathering_empty` |
+| 创建失败 | `CreatePeerConnection` 异常 / 失败 | `pc_create_failed` |
 
-推荐实现语义：
+规则：
+
+1. **独立任务**：`StartPublicIpRefreshThread()` / `StopPublicIpRefreshThread()`，与 ICE 会话生命周期解耦；`Stop()` / 析构时 join。
+2. **周期间隔**：`webrtc_public_ip_refresh_sec`（默认 **300** 秒）。设为 `0` 则关闭周期轮询，仍保留失败路径按需重探。
+3. **失败重探**：ICE Failed / gathering 空候选 / PC 创建失败 → `RequestPublicIpRefresh`，经 condition_variable 唤醒线程。
+4. **防抖**：按需请求距上次成功探测不足 **15s** 则跳过，避免失败风暴打满 STUN。
+5. **串行化**：`m_publicIpResolveMutex` 保证同一时刻只有一个 Binding 在飞。
+6. **端口占用**：固定端口探测失败时，退化为 ephemeral **仅刷新 IP**；若此前已校验过 `mapped_port == 50000`，则保留“可注入公网 host”状态并更新 IP。
+7. **`ice_mode=relay` / `force_relay`**：不启动公网 IP 发现（host 注入无意义）。
 
 ```text
-start transport / create peer connection
-  └─ if public ip cache empty or stale
-        └─ call IPublicIpResolver::Resolve()
+Init()
+  └─ RefreshPublicIp("init")
+
+Start()
+  └─ thread cae-pubip
+        loop:
+          wait(interval) or wake(on_demand)
+          RefreshPublicIp(reason)
+
+ICE Failed / gathering_empty / pc_create_failed
+  └─ RequestPublicIpRefresh(reason)  // debounce ≥15s
 ```
 
 这样可以保证：
 
-- host candidate 生成前拿到最新公网映射；
-- 不会因为周期轮询把 NAT 映射/UDP 状态弄脏；
-- 代码路径清晰，便于单元测试与故障回退。
+- 拨号换 IP 后周期内自动更新缓存，下次新会话注入新公网 host；
+- 建连失败立刻尝试刷新，缩短“IP 已变但仍用旧缓存”的窗口；
+- 无活跃会话时固定端口探测完整校验映射；有会话时尽量不与 ICE 抢包。
 
 ## 4. 集成点
 
 集成位置：
 
 - `nexartc-cloud-phone-access-engine/app/src/main/cpp/cae_service/WebRtcServerTransport.cpp`
+- 配置：`CaeConfigManage::GetWebRtcPublicIpRefreshSec()` / `CaeConfig.ini`
 
 调用时机：
 
-- `WebRtcServerTransport::Init()`
+- `Init()`：同步首次探测
+- `Start()` / `Stop()`：启停刷新线程
+- ICE / gathering / PC 失败回调：按需唤醒
 
-流程：
+流程（单次 `RefreshPublicIp`）：
 
-1. 读取 `webrtc_local_ip`；
-2. 读取 `webrtc_stun_server`；
-3. 使用 `port_range_begin`（默认 `50000`）做 STUN 探测；
-4. 若返回 `public_port == 50000`，则记录 `m_resolvedPublicIp`；
-5. 若返回端口不一致，则禁用公网 host candidate，仅保留 local host / p2p / relay；
-6. 若 STUN 探测失败且 `webrtc_public_ip` 非空，则打印 deprecated warning，并走兼容 fallback。
+1. 读取 `webrtc_stun_server` 与 `port_range_begin`（默认 `50000`）；
+2. 固定端口 STUN Binding；
+3. 若 `public_port == discoveryPort`，更新 `m_resolvedPublicIp` 并标记 port validated；
+4. 若端口不一致，清空公网 host 注入；
+5. 若固定端口探测失败，ephemeral 探测：仅在已 validated 时更新 IP；
+6. 若仍失败且 `webrtc_public_ip` 非空，deprecated fallback。
 
 ## 5. 配置约定
 
@@ -130,9 +154,11 @@ start transport / create peer connection
 listen_port_h5=50000
 
 [webrtc]
-webrtc_ice_mode=hybrid
+webrtc_ice_mode=host
 webrtc_local_ip=192.168.x.x
+# 默认 host；需要 TURN fallback 时再显式切 hybrid/relay
 webrtc_public_ip=
+webrtc_public_ip_refresh_sec=300
 webrtc_port_range_begin=50000
 webrtc_port_range_end=50000
 webrtc_stun_server=stun:www.signalling-nexartc.cn:3478
@@ -144,6 +170,7 @@ webrtc_turn_secret=<TURN_SECRET>
 说明：
 
 - `webrtc_public_ip`：默认留空，由 STUN 动态发现；
+- `webrtc_public_ip_refresh_sec`：周期刷新秒数，默认 300；`0`=仅失败重探；
 - `listen_port_h5=50000`：WSS 监听端口；
 - `webrtc_port_range_begin/end=50000`：host candidate 使用同一数字端口；
 - 路由器需完成 `50000/UDP` 映射。
@@ -154,9 +181,10 @@ webrtc_turn_secret=<TURN_SECRET>
 
 行为：
 
-- 不发送公网 host candidate；
-- 浏览器继续走 p2p/srflx；
-- 若仍失败，则依赖 TURN relay。
+- 保留上次有效缓存（若有），打 `[STAB]` 日志；
+- 无缓存时不发送公网 host candidate；
+- 浏览器继续走 p2p/srflx / TURN relay；
+- 周期或下次失败事件会再次尝试。
 
 ### 6.2 映射端口不等于 50000
 
@@ -166,6 +194,13 @@ webrtc_turn_secret=<TURN_SECRET>
 - 记录 warning；
 - 不注入公网 host candidate；
 - 自动回退到 p2p/srflx / relay。
+
+### 6.3 建连失败后的刷新
+
+行为：
+
+- `ice_failed` / `gathering_empty` / `pc_create_failed` 触发按需重探；
+- 新结果仅影响**后续**会话的 host candidate；当前已 Failed 的 PC 不会原地改写。
 
 ## 7. 单元测试
 
@@ -197,15 +232,18 @@ bash test/turn/test_cae_public_ip_resolver.sh
 统一口径：
 
 - 端口：`50000`
-- 公网 IP：coturn/STUN 动态发现
+- 公网 IP：coturn/STUN 动态发现（周期 + 失败重探）
 - 优先级：host → p2p/srflx → relay
 
-## 9. 实现状态（2026-07-20）
+## 9. 实现状态
 
 | 项 | 状态 |
 |----|------|
 | `PublicIpResolver.h/.cpp` | ✅ |
-| `WebRtcServerTransport::Init` STUN 探测 + 端口校验 | ✅ |
+| `WebRtcServerTransport::Init` 首次 STUN + 端口校验 | ✅ |
+| 独立 `cae-pubip` 周期刷新线程 | ✅ |
+| ICE Failed / gathering 空 / PC 创建失败按需重探 | ✅ |
+| `webrtc_public_ip_refresh_sec`（默认 300） | ✅ |
 | `webrtc_public_ip` deprecated fallback | ✅ |
 | 固定端口 50000（不再因 TURN 扩到 49152–65535） | ✅ |
 | `test/turn/test_cae_public_ip_resolver.sh` | ✅ |

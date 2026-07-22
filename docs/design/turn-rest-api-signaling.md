@@ -2,6 +2,8 @@
 
 本文档描述如何用信令服务器动态生成 TURN 凭据，供 WebRTC 客户端向 coturn 发起请求并完成鉴权。该方案对应 coturn 的 **TURN REST API**（也称 secret-based timed authentication）。第 12 节给出 **公网 coturn + 内网全锥型 NAT 服务端 + 移动端** 的组网概览；**第 13 节** 给出首选方案 **「公云信令 + 内网 Server 出站注册」** 的完整设计与分步实施指南（无需 frp/nginx/DDNS）。
 
+落地改造见 [`nexartc-turn-mode-a-implementation.md`](./nexartc-turn-mode-a-implementation.md)；**日志路径与分析**见 [`nexartc-logging-design.md`](./nexartc-logging-design.md)。
+
 ## 1. 整体架构
 
 ```mermaid
@@ -681,7 +683,7 @@ turnserver \
 
 `use-auth-secret` / `static-auth-secret` 会自动启用长期凭据模式；不必再显式写 `lt-cred-mech`。如果 coturn 部署在 NAT 后，再补 `--external-ip=<public-ip[/private-ip]>`，否则客户端拿到的 `XOR-RELAYED-ADDRESS` 可能不可达。
 
-### 5.2 生产配置（数据库管理 secret，支持轮换）
+### 5.2 生产配置（数据库管理 secret，可轮换；Mode A 示例仍按单 secret）
 
 ```ini
 use-auth-secret
@@ -708,6 +710,8 @@ turnadmin -s mysecret -r yourcompany.com -b /var/db/turndb
 turnadmin -S -r yourcompany.com -b /var/db/turndb
 turnadmin -X oldsecret -r yourcompany.com -b /var/db/turndb
 ```
+
+本节是 coturn 原生能力；当前 `nexartc-turn-mode-a-*` 示例仍按单个 active `TURN_SECRET` 部署。若启用轮换，先保证 coturn 同时接受新旧 secret，再统一更新 Hub / CAE。
 
 coturn 支持**多个 secret 并存**，静态 secret 和数据库 secret 都会被逐个尝试，便于无缝轮换。
 
@@ -1037,7 +1041,7 @@ app.get('/api/v1/turn-credentials', authenticate, async (req, res) => {
 3. **短 TTL 的作用边界**：短 TTL 主要用于缩小凭据泄露后的滥用窗口，并限制新的 Allocate / 新认证；它不会强制结束已建立的 relay 会话。
 4. **如需硬性到期，业务层配合**：例如停止下发新凭据、在房间结束时主动清理会话，或改用能显式限制会话上限的认证方案。
 5. **HTTPS 传输**：凭据经公网下发，接口必须 TLS。
-6. **Secret 轮换**：数据库多 secret 并存，信令服务器用新 secret 签发，coturn 新旧都接受。
+6. **Secret 轮换**：coturn 可用数据库多 secret 并存；但本仓库 Mode A 示例仍按单个 active `TURN_SECRET` 部署，轮换时先保证 coturn 兼容新旧 secret，再同步更新 Hub / CAE。
 
 ## 8. WebRTC 客户端配置 coturn 地址与凭据
 
@@ -2952,8 +2956,16 @@ sequenceDiagram
 
 **日志建议**
 
-- VPS：Agent register/断开、join 失败、TURN 签发 audit（userId，不含 secret）
-- 内网：Agent 重连次数、WebRTC `iceConnectionState` 变化
+> **生产路径与分析设计（真源）：** [`nexartc-logging-design.md`](./nexartc-logging-design.md)
+
+| 模块 | 主路径 | 关键关键字 |
+|------|--------|------------|
+| Hub | `/opt/nexartc/hub/server/logs/serve_https_*.log` | `[FLOW] agent register` / `client join`；`[FUNC] turn-credentials`；`[EXC] DEVICE_OFFLINE` |
+| coturn | journald + `/var/log/nexartc/coturn.log`（tee 双写） | `[FUNC] auth success`；`[FLOW] ALLOCATE success`；`[EXC] auth failed` |
+| CAE | `/data/local/tmp/cae/logs/cae_server_*.log`；crash → `cae_crash.log` | `[FLOW] registered` / `Connected`；`[STAB] heartbeat`；`[EXC] CRASH` / ICE FAILED |
+| device | 页内面板 / 导出 `nexartc-device-*.log` | `[FLOW] ICE path`；`[EXC] Hub join` / sendDC |
+
+统一前缀：`[FLOW]` 流程 / `[FUNC]` 功能 / `[STAB]` 稳定性 / `[EXC]` 异常。排障按时间线串 Hub → CAE → device → coturn。
 
 **备份与密钥**
 

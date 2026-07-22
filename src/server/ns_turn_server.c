@@ -118,6 +118,11 @@ static inline void log_method(ts_ur_super_session *ss, const char *method, int e
             TURN_LOG_LEVEL_INFO, "session %018llu: realm <%s> user <%s>: incoming packet %s processed, success\n",
             (unsigned long long)(ss->id), (const char *)(ss->realm_options.name), (const char *)(ss->username), method);
       }
+      /* Explicit FLOW marker for Allocate (design Mode A connectivity grep). */
+      if (method && (!strcmp(method, "ALLOCATE") || !strcmp(method, "Allocate") || strstr(method, "ALLOCATE"))) {
+        TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "session %018llu: [FLOW] ALLOCATE success user=<%s>\n",
+                      (unsigned long long)(ss->id), (const char *)(ss->username));
+      }
     } else {
       if (!reason) {
         reason = get_default_reason(err_code);
@@ -3588,7 +3593,7 @@ static int check_stun_auth(turn_turnserver *server, ts_ur_super_session *ss, stu
       }
     }
 
-    TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "session %018llu: %s: Cannot find credentials of user <%s>\n",
+    TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "session %018llu: %s: [EXC] Cannot find credentials of user <%s> (auth failed)\n",
                   (unsigned long long)(ss->id), __FUNCTION__, (char *)usname);
     *err_code = 401;
     return create_challenge_response(ss, tid, resp_constructed, err_code, reason, nbh, method);
@@ -3607,13 +3612,19 @@ static int check_stun_auth(turn_turnserver *server, ts_ur_super_session *ss, stu
       }
     }
 
-    TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "session %018llu: %s: user %s credentials are incorrect\n",
+    TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "session %018llu: %s: [EXC] user %s credentials are incorrect (auth failed)\n",
                   (unsigned long long)(ss->id), __FUNCTION__, (char *)usname);
     *err_code = 401;
     return create_challenge_response(ss, tid, resp_constructed, err_code, reason, nbh, method);
   }
 
   *message_integrity = 1;
+  {
+    char smethod[17] = {0};
+    stun_method_str(method, smethod);
+    TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "session %018llu: [FUNC] auth success user=<%s> method=%s\n",
+                  (unsigned long long)(ss->id), (char *)usname, smethod);
+  }
 
   return 0;
 }

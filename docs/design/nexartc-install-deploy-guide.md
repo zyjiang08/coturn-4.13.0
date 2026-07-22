@@ -5,9 +5,11 @@
 > 关联文档：  
 > - [`nexartc-turn-mode-a-implementation.md`](./nexartc-turn-mode-a-implementation.md)（设计与 ICE 策略）  
 > - [`nexartc-turn-mode-a-vps-deployment.md`](./nexartc-turn-mode-a-vps-deployment.md)（VPS 验收记录）  
-> - [`cae-stun-public-ip-discovery.md`](./cae-stun-public-ip-discovery.md)（STUN 动态公网 IP）
+> - [`cae-stun-public-ip-discovery.md`](./cae-stun-public-ip-discovery.md)（STUN 动态公网 IP）  
+> - [`nexartc-logging-design.md`](./nexartc-logging-design.md)（**日志路径、四类前缀、分析排障**）
 
-本文说明 **编译 → 产物路径 → 安装 → 配置 → 测试 URL → 日志定位** 的完整闭环。当前生产拓扑以 **VPS `120.79.21.28` / `www.signalling-nexartc.cn`** 为准。
+本文说明 **编译 → 产物路径 → 安装 → 配置 → 测试 URL → 日志定位** 的完整闭环。当前生产拓扑以 **VPS `120.79.21.28` / `www.signalling-nexartc.cn`** 为准。  
+日志路径与分析设计以 [`nexartc-logging-design.md`](./nexartc-logging-design.md) 为准；§8 为运维速查副本。
 
 ---
 
@@ -121,7 +123,7 @@ export LD_LIBRARY_PATH=/tmp/libevent-local/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_
 | 中继端口 | `49152–65535` |
 | `external-ip` | `120.79.21.28/<内网 NIC IP>` |
 | `realm` | `nexartc.com` |
-| 日志 | **`verbose` 默认开启**；`--log-file=stdout` → `journalctl -u nexartc-coturn` |
+| 日志 | **`verbose` 默认开启**；双写：**journald** + **文件** `/var/log/nexartc/coturn.log`（logrotate 日切 14 天） |
 
 **一键部署（含 coturn 配置同步）：**
 
@@ -135,10 +137,25 @@ export LD_LIBRARY_PATH=/tmp/libevent-local/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_
 /usr/bin/ssh -i ~/.ssh/id_ed25519 root@signalling-nexartc.cn '
   systemctl restart nexartc-coturn
   systemctl status nexartc-coturn --no-pager
+
+  # 1) journald（实时）
   journalctl -u nexartc-coturn -n 80 --no-pager
+
+  # 2) 文件日志（离线拉取 / grep）
+  ls -lh /var/log/nexartc/coturn.log*
+  tail -n 80 /var/log/nexartc/coturn.log
+  grep -E "\[FLOW\]|\[FUNC\]|\[EXC\]|auth success|ALLOCATE success" /var/log/nexartc/coturn.log | tail -40
 '
 ```
 
+**日志双写说明：**
+
+| 通道 | 路径 / 命令 | 用途 |
+|------|-------------|------|
+| journald | `journalctl -u nexartc-coturn -f` | 实时排障、与 systemd 生命周期对齐 |
+| 文件 | `/var/log/nexartc/coturn.log` | 离线 `scp`/grep；logrotate：`/etc/logrotate.d/nexartc-coturn`（日切、14 份、`maxsize 50M`） |
+
+实现：`nexartc-coturn.service` 使用 `--log-file=stdout` + `tee -a /var/log/nexartc/coturn.log`，同一 verbose 流同时进 journald 与文件。
 **公网 Allocate 自检（开发机）：**
 
 ```bash
@@ -295,15 +312,19 @@ curl -sk https://120.79.21.28/device/ | grep -oE 'index-[A-Za-z0-9_-]+\.js'
 
 ### 4.3 Web 客户端日志（默认开启）
 
-device 页默认在页面日志面板 + DevTools Console 输出，前缀示例：
+> 完整路径与分析见 [`nexartc-logging-design.md`](./nexartc-logging-design.md)。
+
+device 页默认在页面日志面板 + DevTools Console 输出；支持「复制 / 导出」为 `nexartc-device-*.log`。前缀示例：
 
 | 日志关键字 | 含义 |
 |------------|------|
-| `ICE 模式: host\|hybrid\|relay\|p2p` | 当前 ICE 策略 |
+| `[FLOW]` / `ICE 模式: host\|hybrid\|relay\|p2p` | 会话流程与 ICE 策略 |
 | `ICE 配置: mode=... TURN=ON\|OFF` | PeerConnection iceServers |
 | `connectionState=connected` | PC 已连通 |
 | `ICE path: ... (host\|p2p\|relay)` | **选中** ICE 路径（最关键） |
-| `TURN 凭据已获取` | hybrid/relay 拉到 Hub 临时凭据 |
+| `[FUNC] TURN 凭据已获取` | hybrid/relay 拉到 Hub 临时凭据 |
+| `[STAB] heartbeat` / `video health` | 心跳与解码健康 |
+| `[EXC]` | join 失败、sendDC SKIP、ICE diagnostics |
 
 无需额外开关；打开页面即有完整信令 / ICE / Stats 日志（Stats 约每 5s）。
 
@@ -456,12 +477,15 @@ adb shell "su -c 'sed -i \"s/^webrtc_local_ip=.*/webrtc_local_ip=192.168.124.101
 
 ### 5.5 CAE 日志（默认开启）
 
-CAE **默认即详细日志**，无需额外 verbose 开关。
+> 完整路径、crash 与四类前缀见 [`nexartc-logging-design.md`](./nexartc-logging-design.md)。
+
+CAE **默认即详细日志**，无需额外 verbose 开关。排障优先拉 **文件日志**（logcat 环缓可能丢历史）。
 
 | 通道 | 位置 | 说明 |
 |------|------|------|
+| 文件日志 | `/data/local/tmp/cae/logs/cae_server_*.log` | 主路径；轮转约 4×2MB |
+| Crash | 同目录 `cae_crash.log` / `cae_signal.log` | `[EXC] CRASH` + backtrace |
 | logcat | tag `CAE` | 实时：`adb logcat -s CAE` |
-| 文件日志 | `/data/local/tmp/cae/logs/cae_server_*.log` | 轮转文件，容量较大 |
 | 应用私有 | `/data/user/0/com.nexartc.cloudapp/files/cae/logs/` | 视启动路径而定 |
 
 **常用过滤：**
@@ -469,27 +493,27 @@ CAE **默认即详细日志**，无需额外 verbose 开关。
 ```bash
 SERIAL=<adb_serial>
 
-# 实时
-adb -s "$SERIAL" logcat -s CAE | grep -iE \
-  'ice_mode|ice-lite|WebRTC config|candidate|PeerConnection|registered|FAILED|OnReady'
+# 实时（含四类前缀）
+adb -s "$SERIAL" logcat -s CAE | grep -E \
+  '\[FLOW\]|\[FUNC\]|\[STAB\]|\[EXC\]|ice_mode|candidate|registered|FAILED|OnReady'
 
 # 文件（最新一轮会话）
 adb -s "$SERIAL" shell "su -c '
   LOG=\$(ls -t /data/local/tmp/cae/logs/cae_server_*.log | head -1)
-  grep -E \"ice_mode|candidate sent|state=2\\(Connected\\)|typ relay|TURN REST|OnReady\" \$LOG | tail -80
+  grep -E \"\\[FLOW\\]|\\[FUNC\\]|\\[STAB\\]|\\[EXC\\]|ice_mode|candidate sent|Connected|TURN REST|OnReady\" \$LOG | tail -80
 '"
 ```
 
 | 日志关键字 | 含义 |
 |------------|------|
+| `[FLOW] registered` / `Connected` / `OnReady` | Agent 注册 → ICE 通 → 业务就绪 |
 | `WebRTC config: ice_mode=host local_ip='...'` | 策略与注入局域网 IP |
 | `discovered public IP via STUN ... -> x.x.x.x:50000` | 公网 host 可用 |
-| `offer annotated with a=ice-lite` | host 模式角色（浏览器 controlling） |
 | `candidate sent ... typ host` | CAE 发出的 host（确认 IP 是否正确） |
-| `TURN REST credentials` | 本会话启用了 TURN（hybrid/relay） |
+| `[FUNC] TURN REST` / Media / touch | 凭据、媒体、注入 |
+| `[STAB] heartbeat` / queue overflow | 心跳与队列压力 |
 | `state=2(Connected)` | ICE/DTLS 已通 |
-| `All 9 DataChannels open` / `OnReady` | 业务就绪，开始推流 |
-| `track not open ... pc_state=1` | 仍 Connecting，媒体未通路 |
+| `[EXC] CRASH` / ICE FAILED / inject fail | 异常；立即 flush |
 | `CaeSignalAgent: registered with Hub` | Agent 在线 |
 
 确认 Agent：
@@ -599,25 +623,56 @@ https://120.79.21.28/device/?turn_token=<STREAM_TOKEN>&device_id=device-mi9-001
 
 ## 8. 各模块日志速查（默认全开）
 
+> **设计真源（路径 / 双写 / 分类 / 时间线 / 排障矩阵）：** [`nexartc-logging-design.md`](./nexartc-logging-design.md)
+
 ### 8.1 总表
 
 | 模块 | 默认级别 | 查看命令 |
 |------|----------|----------|
-| **coturn** | `verbose`（conf 已开） | `journalctl -u nexartc-coturn -f` |
+| **coturn** | `verbose`（conf 已开） | journald：`journalctl -u nexartc-coturn -f`；文件：`tail -f /var/log/nexartc/coturn.log` |
 | **Hub** | INFO + 文件轮转 | `journalctl -u nexartc-hub -f`；`tail -f /opt/nexartc/hub/server/logs/serve_https_1.log` |
-| **device 页** | 页面 + Console 全开 | 浏览器 F12 / 页内日志面板；搜 `ICE path` |
-| **CAE** | 全量 CAE tag + 文件 | `adb logcat -s CAE`；`/data/local/tmp/cae/logs/cae_server_*.log` |
+| **device 页** | 页面 + Console 全开 | 浏览器 F12 / 页内日志面板（复制/导出）；搜 `ICE path` / `[FLOW]` |
+| **CAE** | 全量 CAE tag + 文件 | `adb logcat -s CAE`；`/data/local/tmp/cae/logs/cae_server_*.log`；crash → `cae_crash.log` |
+
+### 8.1.1 四类日志前缀（grep）
+
+| 前缀 | 含义 | 典型关键字 |
+|------|------|------------|
+| `[FLOW]` | 主流程里程碑 | `registered` / `client_attached` / `verify` / `CreatePeerConnection` / `Connected` / `OnReady` / `ALLOCATE success` / `connect begin` / `session teardown` |
+| `[FUNC]` | 业务功能结果 | `TURN 凭据已获取` / `auth success` / `Media stream opened` / `touch` / `HandleKeyMsg` / `turn-credentials issued` |
+| `[STAB]` | 稳定性 | `heartbeat timeout` / `send queue overflow` / `CloseOldClient` / `BWE` / `track not open` / `video health` / `backpressure` / `agent heartbeat timeout` |
+| `[EXC]` | 异常失败 | `ICE/DTLS path FAILED` / `auth failed` / `REST TTL expired` / `sendDC SKIP` / `DEVICE_OFFLINE` / `CRASH` |
+
+```bash
+# CAE
+adb shell "su -c 'grep -E \"\\[FLOW\\]|\\[FUNC\\]|\\[STAB\\]|\\[EXC\\]\" /data/local/tmp/cae/logs/cae_server_*.log | tail -80'"
+
+# Hub
+grep -E '\[FLOW\]|\[FUNC\]|\[STAB\]|\[EXC\]' /opt/nexartc/hub/server/logs/serve_https_*.log | tail -80
+
+# coturn
+journalctl -u nexartc-coturn --since '10 min ago' --no-pager \
+  | grep -E '\[FLOW\]|\[FUNC\]|\[EXC\]|auth success|ALLOCATE success'
+# 或文件（与 journal 同流）
+grep -E '\[FLOW\]|\[FUNC\]|\[EXC\]|auth success|ALLOCATE success' /var/log/nexartc/coturn.log | tail -80
+
+# device：面板搜 [FLOW] / [EXC] / ICE path；或点「导出」
+```
+
+一次成功会话期望顺序：`[FLOW] registered` → `[FLOW] client_attached` → `[FLOW] verify` → `[FLOW] Connected` → `[FLOW] OnReady` → `[FUNC] media/touch`。
 
 ### 8.2 典型故障对照
 
 | 现象 | 优先看 | 常见原因 |
 |------|--------|----------|
-| Agent 不在线 | CAE `SignalAgent`；Hub `[agent]` | `signal_agent_url` / `agent_token` / TLS |
-| 一直 Connecting | CAE `candidate sent` 的 IP | `webrtc_local_ip` ≠ wlan0 |
-| 无视频但 Connected | CAE `sendFrame` / 浏览器 decoded | 码率/解码；非 ICE 问题 |
-| 只有 relay 才通 | 浏览器 `ICE path` | 同 NAT hairpin；host 需局域网或 DNAT 50000 |
+| Agent 不在线 | CAE `[FLOW] SignalAgent`；Hub `[FLOW] agent` | `signal_agent_url` / `agent_token` / TLS |
+| 一直 Connecting | CAE `candidate sent` 的 IP；`[EXC] gathering` | `webrtc_local_ip` ≠ wlan0 |
+| 无视频但 Connected | CAE `sendFrame`；device `[STAB] video health` | 码率/解码；非 ICE 问题 |
+| 只有 relay 才通 | 浏览器 `[FLOW] ICE path` | 同 NAT hairpin；host 需局域网或 DNAT 50000 |
 | 页面旧逻辑 | `index-*.js` hash | 未 `deploy_vps.sh` 或未硬刷新；域名被拦应用 IP |
-| TURN 401 | Hub credentials API | `turn_token` ≠ `STREAM_TOKEN` |
+| TURN 401 | Hub `[EXC] turn-credentials`；coturn `[EXC] auth failed` | `turn_token` ≠ `STREAM_TOKEN` / secret 不一致 / TTL 过期 |
+| 触控无响应 | device `[EXC] sendDC SKIP`；CAE `[EXC] HandleTouchMsg` | DC 未 open / 注入失败 |
+| 进程崩溃 | `cae_crash.log` / `[EXC] CRASH` | 对照 backtrace |
 
 ### 8.3 建议的一次排障命令包
 
@@ -634,12 +689,12 @@ curl -sk https://120.79.21.28/device/ | grep -oE 'index-[A-Za-z0-9_-]+\.js'
 echo "=== CAE recent WebRTC ==="
 adb -s "$SERIAL" shell "su -c '
   LOG=\$(ls -t /data/local/tmp/cae/logs/cae_server_*.log | head -1)
-  grep -E \"ice_mode|local_ip|candidate sent|Connected|FAILED|OnReady|TURN REST\" \$LOG | tail -40
+  grep -E \"\\[FLOW\\]|\\[FUNC\\]|\\[STAB\\]|\\[EXC\\]|ice_mode|local_ip|candidate sent|Connected|FAILED|OnReady|TURN REST\" \$LOG | tail -60
 '"
 
 echo "=== coturn / hub (VPS) ==="
 /usr/bin/ssh -i ~/.ssh/id_ed25519 root@signalling-nexartc.cn \
-  'journalctl -u nexartc-hub -u nexartc-coturn --since "10 min ago" --no-pager | tail -40'
+  'journalctl -u nexartc-hub -u nexartc-coturn --since "10 min ago" --no-pager | grep -E "\\[FLOW\\]|\\[FUNC\\]|\\[STAB\\]|\\[EXC\\]|auth success|ALLOCATE" | tail -40'
 ```
 
 ---
@@ -675,4 +730,5 @@ echo "=== coturn / hub (VPS) ==="
 
 | 日期 | 说明 |
 |------|------|
+| 2026-07-21 | 关联 [`nexartc-logging-design.md`](./nexartc-logging-design.md)；§8 标明为运维速查副本 |
 | 2026-07-20 | 首版安装部署手册：coturn / Hub / device / CAE；默认 host ICE；日志默认全开说明 |

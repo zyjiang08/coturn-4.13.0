@@ -610,6 +610,15 @@ int get_user_key(int in_oauth, int *out_oauth, int *max_session_time, uint8_t *u
           }
         }
       }
+      if (ret != 0) {
+        TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR,
+                      "[EXC] auth failed: REST HMAC mismatch user=<%s> expiry=%lu now=%lu (wrong TURN_SECRET?)\n",
+                      (char *)usname, (unsigned long)ts, (unsigned long)ctime);
+      }
+    } else {
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR,
+                    "[EXC] auth failed: REST TTL expired user=<%s> expiry=%lu now=%lu (re-fetch /turn-credentials)\n",
+                    (char *)usname, (unsigned long)ts, (unsigned long)ctime);
     }
 
     clean_secrets_list(&sl);

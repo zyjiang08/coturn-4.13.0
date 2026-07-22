@@ -9,7 +9,9 @@
 | 浏览器客户端（页面） | `nexartc-cloudPhoneAccess-web/device/` | SPA 静态资源；固定域名连 Hub；REST 取 TURN 凭据；现有 type 1–5 不变 |
 | 云手机媒体服务 | `nexartc-cloud-phone-access-engine/` | **始终在家庭内网**；出站注册到 Hub；本地生成 TURN 凭据（方案 B）；双端 relay |
 
-配套理论与算法细节仍以 `turn-rest-api-signaling.md` 为准；本文只写 **与现有代码如何对接、改什么、按什么顺序上线**。
+配套理论与算法细节仍以 `turn-rest-api-signaling.md` 为准；本文只写 **与现有代码如何对接、改什么、按什么顺序上线**。  
+**日志路径、四类前缀与排障分析**见 [`nexartc-logging-design.md`](./nexartc-logging-design.md)。  
+若需要补一层 **CAE 异常自愈 / 远程运维**，请同时参考 [`cae-supervisor-remote-admin-design.md`](./cae-supervisor-remote-admin-design.md)。
 
 **可以先本地验证，再迁到 VPS。** 云手机固定在家庭内网；浏览器页面推荐随 Hub 部署（本地或 VPS），用户用手机/电脑打开该 URL。详见 [§0 部署位置与本地→VPS 验证路径](#0-部署位置与本地vps-验证路径)。
 
@@ -278,13 +280,13 @@ webrtc_turn_secret=...
 
 | 参数 | 模式 | 说明 |
 |------|------|------|
-| （默认） | hybrid | Hub 签发 TURN；Stats 打印 `ICE path: ... (host\|p2p\|relay)` |
+| （默认） | host | 仅 host 直连；Stats 打印 `ICE path: ... (host\|p2p\|relay)` |
 | `?ice_mode=relay` 或 `?force_relay=1` | relay | 强制浏览器仅 relay |
 | `?ice_mode=p2p` 或 `?no_relay=1` | p2p | 跳过 TURN 凭据；忽略 CAE relay candidate；**无 relay 兜底** |
 
 **device 页加载建议**：生产调试优先 `https://120.79.21.28/device/`（bundle 最新）；`www.signalling-nexartc.cn/device/` 在部分网络/自动化 curl 下可能超时或缓存旧 JS——以页面日志是否出现 `ICE 模式: p2p` / `mode=hybrid` 为准，并 **Ctrl+Shift+R** 硬刷新。
 
-**注意**：libjuice 在 `enableIceUdpMux=1` 时无法 TURN allocate；配置了 TURN 时会自动关闭 udp_mux，以便 hybrid 能 fallback 到 relay。
+**注意**：`enableIceUdpMux` 只负责 host candidate 的 50000 单端口绑定；TURN allocation 本身不依赖它。当前实现里，若启用 TURN fallback 且底层路径不支持 mux+TURN，会在 hybrid / relay 场景自动切到独立 TURN socket；host-only 默认仍保持 50000 映射。
 
 ---
 
@@ -702,7 +704,7 @@ if (!m_config.turn_host.empty()) {
 
 3. 删除 / 禁用 `freeturn.net` 硬编码（`WebRtcServerTransport.cpp` L893-896）。
 4. Mode A 下 **不再手工静态配置** `webrtc_public_ip`；改为启动时通过 coturn/STUN 发现公网映射 IP，仅在 LAN 调试时允许手工覆盖。
-5. **UDP mux 与 TURN 的关系**：`enableIceUdpMux` 只影响 host candidate 的本地端口绑定，与 TURN allocation 互不冲突；Mode A 下 `50000` 端口映射保持启用，供 host 直连优先使用。
+5. **UDP mux 与 TURN 的关系**：`enableIceUdpMux` 只负责 host candidate 的本地 50000 端口绑定；TURN allocation 走独立 socket，不依赖 mux。若当前 libjuice 路径在 hybrid / relay 下不支持 mux+TURN，则实现层自动关闭 mux，但 `50000` 的 host 映射仍保留。
 
 #### 4.3 验收
 
@@ -718,7 +720,7 @@ if (!m_config.turn_host.empty()) {
 |----|------|
 | 多客户端 / 设备 | Agent 连接上 session 复用；对齐 `max_streaming_clients` |
 | JWT 登录 | 替换 STREAM_TOKEN；TURN username 用真实 userId |
-| Secret 轮换 | coturn DB 多 secret + Hub 切新 secret（设计文档 §5.2） |
+| Secret 轮换 | 当前示例按单 `TURN_SECRET` 部署；轮换时先保证 coturn 接受新旧 secret，再同步更新 Hub / CAE |
 | 可观测性 | Hub：register/join/签发审计；CAE：`iceConnectionState`；coturn 带宽 |
 | Admin UI | 展示 online agents、强制下线、下发 `device_id` |
 | SDK | `sdk/` 与 `device/` 同一套 iceServers / Hub URL |
@@ -897,13 +899,26 @@ VPS 开放：80/443（TLS）、3478、5349、49152–65535/udp。
 
 ### 8.4 日志关键字
 
+> **路径、双写、四类前缀与排障矩阵（设计真源）：** [`nexartc-logging-design.md`](./nexartc-logging-design.md)
+
+统一前缀：`[FLOW]` 流程 / `[FUNC]` 功能 / `[STAB]` 稳定性 / `[EXC]` 异常。
+
 ```
-Hub:     agent registered / agent offline / DEVICE_OFFLINE / turn-credentials userId=
-CAE:     CaeSignalAgent: registered with Hub / ice_mode=hybrid / onLocalCandidate / sendFrame
-         WebRTC: disabling udp_mux / expanding ICE port range
-device:  ICE 模式: p2p / ICE 配置: mode= / ICE path: ... (p2p|relay)
-         P2P 模式: 忽略 CAE relay candidate / Hub join 失败: agent offline
-coturn:  Allocate / auth success
+Hub:     [FLOW] agent register / client join | [EXC] DEVICE_OFFLINE / join rejected
+         [FUNC] turn-credentials issued userId=…   （不含 secret）
+         文件: /opt/nexartc/hub/server/logs/serve_https_*.log
+CAE:     [FLOW] registered / client_attached / verify / Connected / OnReady
+         [FUNC] Media stream / touch / key | [STAB] heartbeat / queue overflow
+         [EXC] ICE FAILED / inject fail / CRASH
+         文件: /data/local/tmp/cae/logs/cae_server_*.log ；crash: cae_crash.log
+device:  [FLOW] connect / Hub join / ICE path: … (host|p2p|relay)
+         [FUNC] TURN 凭据已获取 | [STAB] heartbeat / video health
+         [EXC] sendDC SKIP / Hub join 失败 / ICE diagnostics
+         面板 + 复制/导出（无 VPS 落盘）
+coturn:  [FUNC] auth success | [FLOW] ALLOCATE success
+         [EXC] auth failed / REST TTL expired / REST HMAC mismatch
+         journald: journalctl -u nexartc-coturn
+         文件: /var/log/nexartc/coturn.log （tee 双写；logrotate 日切）
 ```
 
 **ICE path 判读**（Stats 每 5s）：
@@ -1136,7 +1151,7 @@ test/turn/
 | 编译 | `cd nexartc-cloudPhoneAccess-web/device && npm install && npm run build`（tsc + vite）；混淆版 `npm run build:release` |
 | 产物 | `device/dist/index.html` + `device/dist/assets/*`（约 42 KB JS） |
 | 部署 | 把 `device/dist/` 内容放到 Hub 的 `<WEB_ROOT>/device/` 下（Hub 静态服务托管，页面地址 `https://<hub>:<port>/device/`）；`WEB_ROOT` 可用环境变量覆盖 |
-| 运行时参数 | TURN API 默认同源；`?turn_token=` / `?device_id=`；ICE：`?ice_mode=hybrid\|relay\|p2p`（见 §2.2.1、§16）；调试 relay：`?force_relay=1` |
+| 运行时参数 | TURN API 默认同源；`?turn_token=` / `?device_id=`；ICE 默认 host，显式切换用 `?ice_mode=hybrid\|relay\|p2p`（见 §2.2.1、§16）；调试 relay：`?force_relay=1` |
 | 测试验证 | `test/turn/test_device_e2e.sh`：D1 = `npm run build`；D2 = 无头 Chrome（puppeteer-core，复用 `test/node_modules`）跑 `test/test_turn_credentials_local.mjs`——同源 fetch 凭据 → `RTCPeerConnection(iceTransportPolicy:'relay')` → 断言收集到 `typ relay` 候选 |
 
 ### 15.4 模块 4：CAE 媒体服务器（`nexartc-cloud-phone-access-engine`）
@@ -1183,7 +1198,7 @@ cd test/turn
 
 ```
 https://120.79.21.28/device/?turn_token=<STREAM_TOKEN>&device_id=device-mi9-001
-# hybrid（默认，可省略 ice_mode）
+# host（默认，可省略 ice_mode）
 # 强制 relay：&ice_mode=relay
 # 禁止 relay 对照：&ice_mode=p2p
 ```
@@ -1208,7 +1223,7 @@ Hub WSS 可用 `wss://120.79.21.28/ws` 或域名（用户侧域名 WSS 通常可
 
 ```ini
 [webrtc]
-webrtc_ice_mode=hybrid
+webrtc_ice_mode=host
 webrtc_force_relay=0
 webrtc_stun_server=stun:120.79.21.28:3478
 webrtc_turn_host=120.79.21.28
@@ -1240,11 +1255,13 @@ signal_disable_tls_verify=1
 
 **结论（产品策略）：**
 
-1. **生产默认 hybrid**：NAT hairpin 失败时必须 **TURN fallback**。
+1. **生产默认 host**：先尝试 host 直连；host 不可用时再显式切到 hybrid / relay 走 TURN fallback。
 2. **当前瓶颈不是「要不要 relay」**，而是 **relay 路径 RTP 质量差**（非对称 relay、初始码率高、Hub WSS 与 WebRTC 并行送视频等）。
 3. `?ice_mode=p2p` 仅作 **网络诊断**，不可作为生产默认。
 
 ### 16.4 典型日志时间线（读懂 client 面板）
+
+> 生产路径与四类前缀总表见 [`nexartc-logging-design.md`](./nexartc-logging-design.md)。
 
 **A. hybrid 成功建联但视频差**
 
@@ -1346,7 +1363,7 @@ adb shell am start-foreground-service \
 
 #### P1 — ICE 策略智能化（2–4 周）
 
-4. **自适应 ICE**：hybrid 默认；**host 异常 / 丢包 / jbDelay 超阈值** → 先回退 p2p，再 ICE restart + prefer relay（或短时 `ice_mode=relay`）。
+4. **自适应 ICE**：默认 host；**host 异常 / 丢包 / jbDelay 超阈值** → 再切 hybrid 或短时 `ice_mode=relay`，必要时 ICE restart。
 5. **CAE 侧 p2p 调试开关**：`webrtc_ice_mode=p2p` 时不 gather/send relay（与浏览器 p2p 对照一致）。
 6. **ICE path 可观测性**：Stats 增加 `packetsLost` 增量、选中对 RTT；可选上报 Hub 审计。
 
@@ -1361,6 +1378,7 @@ adb shell am start-foreground-service \
 
 11. **Hub 与媒体分离监控**：信令 WSS 带宽 vs RTP 分离仪表盘。
 12. **可选 SFU**：多观众时避免 CAE 多路 relay 翻倍带宽。
+13. **CAE 监控进程 / 远控面**：独立 Supervisor 常驻，负责 CAE 异常重启、Admin 远控、公网 IP 上报（见 `cae-supervisor-remote-admin-design.md`）。
 
 ### 16.7 相关源码速查（联调改动集中处）
 
@@ -1380,3 +1398,4 @@ adb shell am start-foreground-service \
 - **VPS 运维步骤**（证书、密钥、systemd）：[`nexartc-turn-mode-a-vps-deployment.md`](./nexartc-turn-mode-a-vps-deployment.md)
 - 每次 **ICE/TURN/Hub 相关联调** 后，请在本节追加一行到 **§16.3 实测表** 或 **§16.2 修复表**，并更新 **§14.5** checklist。
 - `STREAM_TOKEN` / `AGENT_TOKEN` / `TURN_SECRET` **勿写入 Git**；示例 token 轮换见 VPS 文档 §8.5。
+- 若要做 CAE 异常自愈 / 远程重启 / 公网 IP 上报，先读 `cae-supervisor-remote-admin-design.md` 再动代码。

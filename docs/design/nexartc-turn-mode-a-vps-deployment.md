@@ -3,6 +3,7 @@
 > 日期：2026-07-12  
 > 依据：[`nexartc-turn-mode-a-implementation.md`](./nexartc-turn-mode-a-implementation.md) §0 / Phase 0b / P0  
 > **完整安装步骤（编译 / 产物 / 配置 / 测试 URL / 日志）：** [`nexartc-install-deploy-guide.md`](./nexartc-install-deploy-guide.md)  
+> **日志路径与分析设计（真源）：** [`nexartc-logging-design.md`](./nexartc-logging-design.md)  
 > 目标域名：`www.signalling-nexartc.cn`（A → `120.79.21.28`）  
 > 云手机：家庭内网 MI 9（adb `9898d727`），**未**迁到 VPS
 
@@ -19,7 +20,7 @@
 | 浏览器 Trickle ICE `typ relay`（强制 relay） | ✅ 收集到 3 个 relay 候选（relay IP=`120.79.21.28`） |
 | 域名 HTTPS `https://www.signalling-nexartc.cn/` | ✅ 服务端正常（VPS 本机 + 用户侧可访问）；证书 SAN 匹配 |
 | 域名 HTTPS（部分外网 ISP） | ⚠️ 个别网络仍可能在 TLS 握手阶段 RST（与运营商/备案策略有关）；可用 IP 或 `:9443` 兜底 |
-| CAE 真机写入 TURN 方案 B 配置并启动 | ✅ APK/root 路径；`webrtc_ice_mode=hybrid` |
+| CAE 真机写入 TURN 方案 B 配置并启动 | ✅ APK/root 路径；默认 `host`（联调 relay 时显式切 `hybrid`） |
 | Phase 3 `/agent` + `/ws` 房间路由 | ✅ `test/turn/test_hub_phase3.mjs` / `deploy_vps.sh` |
 | hybrid ICE + relay 出画（MI 9 联调） | ⚠️ 可 connected；relay 路径 **高丢包/卡顿**（见实现文档 §16） |
 | p2p-only 对照（`?ice_mode=p2p`） | ✅ 同公网 srflx **~19s ICE failed** → 当前网络 **必须 TURN** |
@@ -30,7 +31,7 @@
 
 - 页面（当前 VPS 测试 token 见 §8.4）：
   `https://120.79.21.28/device/?turn_token=<STREAM_TOKEN>&device_id=device-mi9-001`
-- ICE 模式：`&ice_mode=hybrid`（默认，host → p2p → relay）| `&ice_mode=relay` | `&ice_mode=p2p`（仅诊断）
+- ICE 模式：`&ice_mode=host`（默认）| `&ice_mode=hybrid`（host → p2p → relay）| `&ice_mode=relay` | `&ice_mode=p2p`（仅诊断）
 - 调试强制 relay：在 URL 末尾加 `&force_relay=1` 或 `&ice_mode=relay`；日常优先验证 host 端口映射，再看 p2p
 - Health：`https://120.79.21.28/api/v1/health`
 - Agent 列表：`GET /api/v1/agents`（Bearer `STREAM_TOKEN`）
@@ -59,7 +60,7 @@ TURN/STUN UDP 走域名 `www.signalling-nexartc.cn:3478` **不受** HTTPS SNI �
 └─ 静态页 /opt/nexartc/hub/device/
 
 家庭内网 MI 9 (CAE)
-└─ webrtc_ice_mode=hybrid
+└─ webrtc_ice_mode=host
    webrtc_turn_host=120.79.21.28
    webrtc_turn_secret=<与 Hub/coturn 相同>
    signal_agent_url=wss://120.79.21.28/agent
@@ -157,8 +158,8 @@ cd nexartc-cloud-phone-access-engine/output/server
 ./deploy.sh <serial>
 adb -s <serial> install -r CaeServer-root-debug.apk
 
-# 写入 [webrtc]（host 优先，secret 与 VPS TURN_SECRET 一致）
-webrtc_ice_mode=hybrid
+# 写入 [webrtc]（默认 host，secret 与 VPS TURN_SECRET 一致）
+webrtc_ice_mode=host
 webrtc_local_ip=192.168.124.103
 webrtc_public_ip=                # 运行时通过 coturn/STUN 发现公网映射 IP
 webrtc_port_range_begin=50000
@@ -266,13 +267,18 @@ https://www.signalling-nexartc.cn/device/?turn_token=6dc053f3124cda23a4279e8f34e
 
 ## 5. 运维速查
 
+> 日志路径、四类前缀与排障矩阵见 [`nexartc-logging-design.md`](./nexartc-logging-design.md)。
+
 ```bash
 # 状态
 ssh root@signalling-nexartc.cn 'systemctl status nexartc-hub nexartc-coturn --no-pager'
 
-# 日志
+# 日志（Hub 文件 + coturn 双写）
 journalctl -u nexartc-hub -f
+tail -f /opt/nexartc/hub/server/logs/serve_https_1.log
 journalctl -u nexartc-coturn -f
+tail -f /var/log/nexartc/coturn.log
+grep -E '\[FLOW\]|\[FUNC\]|\[EXC\]|auth success|ALLOCATE success' /var/log/nexartc/coturn.log | tail -40
 
 # 重载配置
 # 改 /etc/nexartc/hub.env 或 turnserver.conf 后：
@@ -401,11 +407,12 @@ systemctl restart nexartc-coturn nexartc-hub
 1. **P0 媒体质量**：✅ Hub WSS A/V 抑制 + 降低 BWE 初值 + 固定 50000 端口（见实现文档 §16.6）。  
 2. **Agent 保活**：✅ Hub 模式会话结束保持 Signal Agent；断线自动重连已有。Admin lastPing 告警待做。  
 3. **发布流程**：✅ `deploy_vps.sh` 默认跑 `build_all.sh`（`--skip-build` 跳过）。  
-4. 阿里云安全组确认 UDP 中继端口段长期开放；磁盘占用已 ~90%，建议清理 `/root` 大包。  
-5. 正式运营前轮换 `STREAM_TOKEN` / `AGENT_TOKEN` / `TURN_SECRET`（§8.5）；勿提交 Git。  
-6. ICP 备案完成后统一 `www.signalling-nexartc.cn/device/` 入口，避免 IP/域名双轨 stale bundle。  
-7. Phase 5：JWT 登录替代固定 `STREAM_TOKEN`。  
-8. **STUN 公网 IP 发现**：✅ `PublicIpResolver`（见 `cae-stun-public-ip-discovery.md`）；设备侧清空 `webrtc_public_ip` 并确保路由器 DNAT `50000/UDP`。
+4. **CAE 异常自愈**：若要由监控进程接管 CAE 重启、远程配置和公网 IP 上报，见 [`cae-supervisor-remote-admin-design.md`](./cae-supervisor-remote-admin-design.md)。  
+5. 阿里云安全组确认 UDP 中继端口段长期开放；磁盘占用已 ~90%，建议清理 `/root` 大包。  
+6. 正式运营前轮换 `STREAM_TOKEN` / `AGENT_TOKEN` / `TURN_SECRET`（§8.5）；勿提交 Git。  
+7. ICP 备案完成后统一 `www.signalling-nexartc.cn/device/` 入口，避免 IP/域名双轨 stale bundle。  
+8. Phase 5：JWT 登录替代固定 `STREAM_TOKEN`。  
+9. **STUN 公网 IP 发现**：✅ `PublicIpResolver`（见 `cae-stun-public-ip-discovery.md`）；设备侧清空 `webrtc_public_ip` 并确保路由器 DNAT `50000/UDP`。
 
 ---
 
