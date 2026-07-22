@@ -288,6 +288,10 @@ webrtc_turn_secret=...
 
 **注意**：`enableIceUdpMux` 只负责 host candidate 的 50000 单端口绑定；TURN allocation 本身不依赖它。当前实现里，若启用 TURN fallback 且底层路径不支持 mux+TURN，会在 hybrid / relay 场景自动切到独立 TURN socket；host-only 默认仍保持 50000 映射。
 
+**多客户端 + 单端口 DNAT（方案 A）：** Mode A host 下多个 PeerConnection 共用 libjuice ICE UDP Mux。Demux（按 ufrag/五元组分发）留在 libjuice；CAE 会话层做生命周期逻辑分离（全局 RTP 暂停、有同伴时同步 `pc->close()`、有 RUNNING 客户端时不拆编码器/Agent），保证「两台同看 → 一台停 → 另一台继续」。详见专项设计：
+
+- [`nexartc-webrtc-ice-udp-mux-logical-separation.md`](./nexartc-webrtc-ice-udp-mux-logical-separation.md)
+
 ---
 
 ## 3. 端到端时序（落地版）
@@ -1025,6 +1029,8 @@ Phase 5   多会话 / JWT / 运维
 | `libs/openssl/include/openssl/{hmac,base64}.h` | CAE 侧 HMAC-SHA1 / Base64（BoringSSL） |
 | `coturn` `src/apps/relay/userdb.c` | `get_user_key` / REST 时间戳校验 |
 | [`nexartc-turn-mode-a-vps-deployment.md`](./nexartc-turn-mode-a-vps-deployment.md) | VPS 部署步骤、ICP 注意、P0 验收记录、§9 快速排障 |
+| [`nexartc-webrtc-ice-udp-mux-logical-separation.md`](./nexartc-webrtc-ice-udp-mux-logical-separation.md) | Mode A host / 单端口 DNAT：ICE UDP Mux **逻辑分离（多观看端）** |
+| [`nexartc-install-deploy-guide.md`](./nexartc-install-deploy-guide.md) | 安装部署与 `webrtc_*` 配置速查 |
 | `test/turn/deploy_vps.sh` | VPS 一键部署 / `--verify-only` |
 
 ---

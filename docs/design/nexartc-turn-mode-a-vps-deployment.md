@@ -60,7 +60,7 @@ TURN/STUN UDP 走域名 `www.signalling-nexartc.cn:3478` **不受** HTTPS SNI �
 └─ 静态页 /opt/nexartc/hub/device/
 
 家庭内网 MI 9 (CAE)
-└─ webrtc_ice_mode=host
+└─ webrtc_ice_mode=host（默认）
    webrtc_turn_host=120.79.21.28
    webrtc_turn_secret=<与 Hub/coturn 相同>
    signal_agent_url=wss://120.79.21.28/agent
@@ -412,7 +412,8 @@ systemctl restart nexartc-coturn nexartc-hub
 6. 正式运营前轮换 `STREAM_TOKEN` / `AGENT_TOKEN` / `TURN_SECRET`（§8.5）；勿提交 Git。  
 7. ICP 备案完成后统一 `www.signalling-nexartc.cn/device/` 入口，避免 IP/域名双轨 stale bundle。  
 8. Phase 5：JWT 登录替代固定 `STREAM_TOKEN`。  
-9. **STUN 公网 IP 发现**：✅ `PublicIpResolver`（见 `cae-stun-public-ip-discovery.md`）；设备侧清空 `webrtc_public_ip` 并确保路由器 DNAT `50000/UDP`。
+9. **STUN 公网 IP 发现**：✅ `PublicIpResolver`（见 `cae-stun-public-ip-discovery.md`）；设备侧清空 `webrtc_public_ip` 并确保路由器 DNAT `50000/UDP`。  
+10. **多观看端 + 单端口 DNAT**：✅ ICE UDP Mux **逻辑分离（方案 A）**——见 [`nexartc-webrtc-ice-udp-mux-logical-separation.md`](./nexartc-webrtc-ice-udp-mux-logical-separation.md)。验收：两台同看 → 断一台 → 另一台继续且 Agent 不 1006。
 
 ---
 
@@ -424,6 +425,7 @@ systemctl restart nexartc-coturn nexartc-hub
 | 面板仍是 `mode=hybrid` 但想测 p2p | URL 是否含 `ice_mode=p2p`；是否硬刷新 | 用 IP 打开 device 页 |
 | ICE connected 但 `decoded=0`、lost 很大 | Stats `ICE path`；CAE logcat `sendFrame`/`PLI` | 见实现文档 §16.6 P0 |
 | p2p 模式 ~19s failed | 预期行为（同公网 srflx hairpin 失败） | 生产用 hybrid |
+| 两台同看，断一台另一台也掉 / Agent 1006 | CAE 是否 `udp_mux=1 port=50000-50000`；有无 `Pure virtual`；有无 `sync close before notify, peers remain` | 见方案 A 文档 §6–§7；确认已部署含真 drain 的 CAE |
 
 ```bash
 # 一键 P0/P3 验收

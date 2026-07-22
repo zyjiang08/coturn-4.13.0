@@ -475,6 +475,10 @@ adb shell "su -c 'sed -i \"s/^webrtc_local_ip=.*/webrtc_local_ip=192.168.124.101
 
 路由器若要测 **公网 host**：需 DNAT **UDP 50000** → 手机；映射端口必须与 `webrtc_port_range_*` 一致，否则不注入公网 host（见 STUN 设计文档）。
 
+多浏览器同时观看时，CAE 在 `webrtc_enable_udp_mux=1` + `50000-50000` 下走 **ICE UDP Mux 逻辑分离（方案 A）**：底层仍单端口 demux，会话层隔离生命周期。详见 [`nexartc-webrtc-ice-udp-mux-logical-separation.md`](./nexartc-webrtc-ice-udp-mux-logical-separation.md)。
+
+当前实现的 `DisconnectClient` 不是旧版固定 sleep，而是先置 `closing`、再等 `SendGate` 的 in-flight 真归零后才 `resetCallbacks()` / `close()`；`CloseAllPeerConnections` 也会先快照 `conn_id` 再逐个串行关闭，避免并发 teardown 重新撞到 mux。
+
 ### 5.5 CAE 日志（默认开启）
 
 > 完整路径、crash 与四类前缀见 [`nexartc-logging-design.md`](./nexartc-logging-design.md)。
@@ -669,6 +673,7 @@ grep -E '\[FLOW\]|\[FUNC\]|\[EXC\]|auth success|ALLOCATE success' /var/log/nexar
 | 一直 Connecting | CAE `candidate sent` 的 IP；`[EXC] gathering` | `webrtc_local_ip` ≠ wlan0 |
 | 无视频但 Connected | CAE `sendFrame`；device `[STAB] video health` | 码率/解码；非 ICE 问题 |
 | 只有 relay 才通 | 浏览器 `[FLOW] ICE path` | 同 NAT hairpin；host 需局域网或 DNAT 50000 |
+| 两台同看，断一台另一台也掉 / Agent 1006 | CAE `udp_mux=1 port=50000-50000`；`Pure virtual`；`sync close before notify, peers remain` | 确认已部署含真 drain 的 CAE；见方案 A 文档 |
 | 页面旧逻辑 | `index-*.js` hash | 未 `deploy_vps.sh` 或未硬刷新；域名被拦应用 IP |
 | TURN 401 | Hub `[EXC] turn-credentials`；coturn `[EXC] auth failed` | `turn_token` ≠ `STREAM_TOKEN` / secret 不一致 / TTL 过期 |
 | 触控无响应 | device `[EXC] sendDC SKIP`；CAE `[EXC] HandleTouchMsg` | DC 未 open / 注入失败 |
