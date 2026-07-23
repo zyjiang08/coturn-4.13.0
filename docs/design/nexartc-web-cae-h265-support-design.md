@@ -12,6 +12,7 @@
 > - [`nexartc-install-deploy-guide.md`](./nexartc-install-deploy-guide.md)
 > - [`nexartc-logging-design.md`](./nexartc-logging-design.md)
 > - [`cae-stun-public-ip-discovery.md`](./cae-stun-public-ip-discovery.md)
+> - [`nexartc-cae-scene-change-blur-qp-design.md`](./nexartc-cae-scene-change-blur-qp-design.md)（QP / 码率与「低延迟」分层）
 
 ---
 
@@ -627,21 +628,66 @@ B frames               0
 I-frame interval       与 WebRTC 配置一致
 Intra refresh          默认关闭，避免与定期 IRAP 冲突
 Parameter sets         每个 IRAP 前保证 VPS/SPS/PPS in-band
-Low latency            厂商支持时启用，失败时去掉该参数重试
+Encoder low-latency    厂商/API 支持时启用（见 §10.5.1），失败时去掉该参数重试
 ```
 
 当前 `HEVCHighTierLevel4` 应改为 Main Tier。High Tier 不是云手机低延迟场景的必要条件，还会缩小 decoder 兼容面。
+
+#### 10.5.1 「低延迟」分层与编码器快速出帧（现状）
+
+产品/联调中「低延迟」易与 WebRTC 配置项混淆。本项目至少分三层：
+
+| 层级 | 含义 | 配置 / 代码 | H.265 现状 |
+|------|------|-------------|------------|
+| A. 播放侧 / SDP | 降低浏览器抖动缓冲（jbDelay） | `webrtc_low_latency`、去 LS、`playout-delay`、`playoutDelayHint=0` | 与 codec 无关；**已实现** |
+| B. 采集侧 | 少等 VSync | `Surface.setFrameRate`（API 30+） | H.264/H.265 共用；**已实现** |
+| C. 编码器「快速出帧」 | MediaCodec 少缓冲、尽快产出 AU | `KEY_LATENCY` / `KEY_PRIORITY` / `FEATURE_LowLatency` / 厂商 key 等 | **未实现**（H.264 同样未开） |
+
+要点：
+
+1. **`webrtc_low_latency` 只驱动层级 A**，不会打开层级 C；不能据此认为「H.265 已开编码低延迟」。
+2. H.265 与 H.264 共用 `ScreenCapture.buildVideoFormat()` / `configure`，**没有**独立的 HEVC encoder-low-latency 开关。
+3. **QP（`qp_i_*` / `qp_p_*`）与层级 C 正交**：QP 管质量地板（见场景切换模糊文档）；C 管编码流水线时延。两者均对 H.264/H.265 共用配置键。
+
+**层级 C — 当前已有（偏实时，但非完整 low-latency）：**
+
+| 设置 | 说明 |
+|------|------|
+| `BITRATE_MODE_CBR` | 码率受控 |
+| `KEY_REPEAT_PREVIOUS_FRAME_AFTER` | 无新帧时重复，避免饿死 |
+| Surface `setFrameRate` | 采集侧绕开部分 VSync（约省 4–8ms） |
+| 未主动开 B 帧 | 仅在设置 QP 时顺带写 B 的 QP key |
+
+**层级 C — 当前缺失（「快速出帧」应对齐的目标）：**
+
+| 参数 | 作用 | 现状 |
+|------|------|------|
+| `MediaFormat.KEY_LATENCY`（API 30+） | 限制编码流水线延迟帧数 | 未设 |
+| `KEY_PRIORITY` = 0（realtime） | 实时优先级 | 未设 |
+| `KEY_OPERATING_RATE` | 提高编码吞吐 | 未设 |
+| `FEATURE_LowLatency` / 厂商 low-latency | 低延迟编码通路 | 未用 |
+
+**实施建议（与 §10.6 降级一致）：**
+
+- 新增可选配置（建议名 `encoder_low_latency`，默认开启或与产品策略对齐），在 `buildVideoFormat()` 中写入上表参数；
+- configure 失败则按 §10.6 去掉 latency/vendor 参数重试，保证 H.265/H.264 仍能起来；
+- 日志区分：`webrtc_low_latency`（A）与 `encoder_low_latency`（C），避免排障混淆；
+- 验收指标：编码端到 RTP 发送的帧时延 / encode time，**不是** jbDelay（jbDelay 只验证 A）。
+
+关联：[`nexartc-cae-scene-change-blur-qp-design.md`](./nexartc-cae-scene-change-blur-qp-design.md) §3.6。
 
 ### 10.6 渐进式 configure 降级
 
 H.265 configure 不能只做“一次完整参数 + 一次相同参数重试”。建议顺序：
 
-1. Main/Main Tier/Level + CBR + low-latency + QP + vendor 参数；
+1. Main/Main Tier/Level + CBR + **encoder** low-latency + QP + vendor 参数；
 2. 去掉 QP 和 vendor 参数；
 3. 保留 Main Profile，去掉显式 level/tier，让 encoder 选择；
-4. 去掉 low-latency，只保留核心参数；
+4. 去掉 **encoder** low-latency，只保留核心参数；
 5. 若允许 fallback，关闭 HEVC codec 实例，创建 H.264 encoder；
 6. 每次失败记录失败阶段、encoder name、异常类型，不打印敏感信息。
+
+说明：步骤中的 low-latency 指 **§10.5.1 层级 C（MediaCodec 快速出帧）**，不是 `webrtc_low_latency`（层级 A）。
 
 只有 H.264 fallback 成功后才能发送 START_SUCCESS，并将实际 codec 返回 Web。
 
