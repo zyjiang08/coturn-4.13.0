@@ -53,7 +53,7 @@ TURN/STUN UDP 走域名 `www.signalling-nexartc.cn:3478` **不受** HTTPS SNI �
 ```
 公网 VPS 120.79.21.28 (Aliyun ECS, Ubuntu 20.04)
 ├─ nexartc-hub.service     Node 20  → :443 + :9443  (TLS = signalling-nexartc.cn 证书)
-├─ nexartc-coturn.service  apt coturn 4.5.1.1
+├─ nexartc-coturn.service  apt coturn 4.5.1.1（勿配 new-log-timestamp，该选项仅新版 coturn 支持）
 │     UDP/TCP 3478, TLS 5349
 │     external-ip=120.79.21.28/172.18.141.122
 │     use-auth-secret + realm=nexartc.com

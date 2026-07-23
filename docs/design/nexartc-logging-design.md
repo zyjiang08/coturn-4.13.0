@@ -58,8 +58,9 @@ flowchart LR
 
 ### 2.2 coturn 双写设计
 
-- **配置**：`test/turn/vps/turnserver.conf` 开 `verbose` + `new-log-timestamp`；**不**在 conf 里写 `log-file=`。
-- **单元**：`nexartc-coturn.service` 使用 `--log-file=stdout`，管道 `tee -a /var/log/nexartc/coturn.log`。
+- **配置**：`test/turn/vps/turnserver.conf` 开 `verbose`；**不**在 conf 里写 `log-file=`。
+  - **勿**对 Ubuntu apt coturn **4.5.x** 启用 `new-log-timestamp`（仅较新 coturn 支持；否则 `Bad configuration format` + systemd 重启循环，STUN 失效导致 CAE host 候选只剩内网 IP）。
+- **单元**：`nexartc-coturn.service` 使用 `--log-file=stdout`，管道 `tee -a /var/log/nexartc/coturn.log`（无 `--new-log-timestamp`）。
   - stdout → systemd → **journald**（实时）
   - tee → **文件**（离线 scp / grep）
 - **轮转**：`/etc/logrotate.d/nexartc-coturn`（源：`test/turn/vps/logrotate-nexartc-coturn.conf`），`copytruncate`，避免打断 tee。

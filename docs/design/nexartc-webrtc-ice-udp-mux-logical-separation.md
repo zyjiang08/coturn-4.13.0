@@ -382,7 +382,8 @@ sequenceDiagram
 | `CreatePeerConnection ... udp_mux=1 port=50000-50000` | 方案 A 生效 |
 | `AddActiveConnId ... active_count=2` | 双端在线 |
 | `StopAction: DisconnectClient conn_id=...`（无 last streamer CloseMedia） | 非最后一端，编码器保留 |
-| `DisconnectClient done ... (sync close before notify, peers remain)` | 有同伴时先 close 再 `OnConnectionLost`（避免业务回调夹在 reset/close 中间） |
+| `DisconnectClient done ... (sync close before notify v2, peers remain)` | 有同伴时先 close 再 `OnConnectionLost`；**v2** 表示已修复「move 进 lambda 后再判断 pc 导致 close 被跳过」 |
+| **不应出现** 连续 `no peer objects` 却伴随 `Pure virtual` / Agent 重启 | 旧 bug：`closePeer` 从未调用，PC 在 pause 释放后析构 |
 | `CloseConnector: N client(s) still RUNNING, skip media/transport teardown` | 业务层未拆全站 |
 | `After WebRTC disconnect: ... remaining (keep media; request IDR)` | 剩余端恢复 IDR |
 | **不应出现** `Pure virtual` / Agent Hub `1006`（因一端离开） | 回归失败 |
