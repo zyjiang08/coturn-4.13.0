@@ -85,8 +85,8 @@
 | 项 | 旧口径 | 当前审查结论 |
 |----|--------|--------------|
 | Chrome 支持 | `Chrome 107+` | Chrome 107 是普通 HEVC 播放能力口径，不等于 WebRTC H.265；Chrome WebRTC H.265 从 M136 起按平台硬件能力启用，仍必须运行时探测 |
-| Web 默认 codec | 文档称默认 H.265 | 当前 `device/src/main.ts` 默认 H.264，仅 `?codec=h265` 才请求 H.265 |
-| CAE 默认 codec | 配置注释称默认 H.264 | APK assets 与 Settings 默认值实际偏向 H.265，部署口径冲突 |
+| Web 默认 codec | 默认 `auto`（优先 H.265，不支持回退 H.264） | 已落地：`codecSelect`/`normalizeCodecPreference` 默认 `auto`；仅首个观看用户锁定编码器 |
+| CAE 默认 codec | 首用户优先 H.265 + fallback | 已落地：`video_codec=h265`，首 streamer 在 `preferred=auto` 时选 H.265 |
 | 设备 H.265 能力 | 认为 `support_h265=1` 即支持 | 当前开源 MediaEngine 固定返回 `H265:1`，没有真实探测 |
 | 端到端完成度 | 记录为已支持 | 尚无能力协商、可靠回退、共享 codec 锁和浏览器矩阵测试 |
 

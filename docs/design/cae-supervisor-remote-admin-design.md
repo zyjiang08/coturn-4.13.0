@@ -200,11 +200,15 @@ CEA Supervisor 直接复用 CAE 已有的 STUN / TURN 探测逻辑，或单独�
 - `am force-stop` / 整包卸载仍会带走同 UID 进程——这属于环境级故障，不在自愈承诺内。
 - root 设备：`BOOT_COMPLETED` → 拉起 Supervisor → Supervisor 再拉起 Worker。
 
-### 10.2 CAE → Supervisor 应用层 liveness（≤30s）
+### 10.2 CAE → Supervisor 三层探活（零周期 su）
 
-路径：`/data/local/tmp/cae/run/liveness.json`（root 可写，跨进程可读）。
+> 背景（2026-07-24）：Supervisor 若每 5s `su -c test -d /proc/$pid` 探 root Worker，Magisk 会刷 Toast「CAE已被授予超级用户权限」。周期探活**禁止**走 su；`su` 仅用于启停/pkill 等低频生命周期。
 
-Worker 每 **5s** 写一次（墙钟毫秒）：
+路径：`/data/local/tmp/cae/run/liveness.json`（Worker 写，mode 允许 app UID 读/删以便 Launcher invalidate）。
+
+#### L1 — 应用层心跳（主探活）
+
+Worker（`CaeLiveness`）每 **5s** 写一次（墙钟毫秒）：
 
 ```json
 {
@@ -218,9 +222,32 @@ Worker 每 **5s** 写一次（墙钟毫秒）：
 }
 ```
 
-Supervisor 判定：
-- `now - ts_ms > 30s` 或文件缺失且本应在跑 → **先杀后启** Worker。
-- 仅 PID 存活但 liveness 停滞 = 僵死，同样重启。
+Supervisor（`:cae_supervisor`）**只信文件年龄**（默认 `supervisor_liveness_timeout_sec=30`）：
+- `present && now - ts_ms ≤ timeout` → 健康。
+- 文件缺失或超时 → `restartCae(liveness_stale|worker_not_running)`。
+- **不**再周期读 `/proc` / `su ps` 判 pid。
+
+僵死覆盖：进程仍在但心跳停写 → 超时后同样重启。
+
+#### L2 — Launcher Process 句柄（秒级死亡感知）
+
+`CaeServerService`（主进程）经 Magisk `su` 拉起 Worker，持有 `Process` 句柄；`AbstractCaeServerService` 健康检查用 `Process.isAlive()`（**无 su**）。
+
+管道/Worker 退出时：Launcher **立即 invalidate** `liveness.json`（unlink 或写 `ts_ms=0` tombstone），避免 Supervisor 在超时窗口内误判仍健康；再走 in-service relaunch。
+
+说明：`Process` 观察的是 `su -c ...` 管道进程，与当前 `exec` 进 Worker 的生命周期绑定；若未来 daemonize 脱钩须同步改 L2。
+
+#### L3 — 旁证（保留）
+
+TCP `listen_port_app`、WebRTC UDP（advisory）、Hub agent poll / pending、`agent_unregistered_too_long`、wlan IP 变化——抓住心跳仍写但业务已挂或 Agent 掉线。
+
+#### `su` 策略
+
+| 操作 | 周期探活 | 启停/pkill/删 liveness（故障时） | Magisk launch |
+|------|----------|----------------------------------|---------------|
+| 允许 | 否 | 是 | 是（仅拉起） |
+
+运维双保险：Magisk 对该应用关闭 Toast / 静默授权（非代码唯一手段）。
 
 ### 10.3 Hub → Supervisor（agent offline）
 
@@ -251,7 +278,7 @@ signal_disable_tls_verify=1
 
 | 检查项 | 动作 |
 |--------|------|
-| liveness 超时 / Worker 进程消失 | kill + start CAE |
+| liveness 超时 / 缺失（L1）或 Launcher Process 退出（L2） | kill + start CAE |
 | `listen_port_app` / WebRTC UDP 端口无人监听且进程在 | restart |
 | `wlan0` IPv4 变化 | 清空无效 `webrtc_local_ip` 覆盖；必要时 restart（host ICE） |
 | Hub agent 离线（pending 或 poll） | restart_cae |

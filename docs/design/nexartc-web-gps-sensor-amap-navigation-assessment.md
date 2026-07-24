@@ -1,8 +1,8 @@
 # nexartc Web GPS/方向传感器 → CAE → 高德导航现状评估
 
-> 评估日期：2026-07-24  
-> 修复更新：2026-07-24（已落地 Web、CAE C++、Android root 后端的可实施项）  
-> 评估范围：Web 端真机浏览器采集 GPS、设备方向及相关传感器，经 WebRTC 传输到 CAE，再注入 Android 并运行高德地图  
+> 评估日期：2026-07-24<br>
+> 修复更新：2026-07-24（已完成二次竞态复核，并落地 Web、CAE C++、Android root 后端的可实施项）<br>
+> 评估范围：Web 端真机浏览器采集 GPS、设备方向及相关传感器，经 WebRTC 传输到 CAE，再注入 Android 并运行高德地图<br>
 > 评估性质：基于当前工作树的代码 review 与本地构建；本轮未向真机注入 GPS、未启动高德，也未修改设备运行状态
 
 ## 1. 结论摘要
@@ -32,7 +32,7 @@
 
 | 能力 | 当前评级 | 说明 |
 |---|---|---|
-| Web GPS 采集 | PoC 可用 | 1 Hz 上限、约 3 m 去抖、5 s 保活发送、范围校验和前后台生命周期已接线 |
+| Web GPS 采集 | PoC 可用 | 1 Hz 上限、约 3 m 去抖、浏览器持续回调时去重最长 5 s、范围校验和前后台生命周期已接线 |
 | Web 设备方向 | PoC 可用 | 10 Hz 上限，iOS compass/absolute orientation/屏幕旋转已处理；真北语义仍需实机校准 |
 | WebRTC 传输 | 可复用 | control DataChannel 路径已存在；TURN 只负责连通性 |
 | root GPS mock | PoC 可用 | TestProvider 错误可回传到 CAE，输入/时效校验已补；仍需当前 Android/高德实机回归 |
@@ -49,12 +49,12 @@
 
 - 消息类型在 `nexartc-cloudPhoneAccess-web/device/src/protocol.ts:15-28` 定义：`SENSOR=23`、`GPS_LOCATION=24`。
 - GPS 帧为 `8B StreamMsgHead + 16B MSG_HEADER + 文本字段`，字段包括 longitude、latitude、altitude、speed、bearing、accuracy、timestamp（`protocol.ts:166-200`）。
-- Sensor 帧为 `8B StreamMsgHead + 16B MSG_HEADER + x:y:z:accuracy`（`protocol.ts:202-229`）。
-- Web 采集逻辑位于 `nexartc-cloudPhoneAccess-web/device/src/main.ts`：GPS 最多 1 Hz、约 `0.00003°` 去抖，并保证最长 5 秒发送一次；motion/orientation 最多 10 Hz。
+- Sensor 帧为 `8B StreamMsgHead + 16B MSG_HEADER + x:y:z:accuracy`（`protocol.ts:202-229`）；浏览器 API 不提供 Android accuracy 枚举，因此 Web 编码为 `0`（unknown/unreliable），不再虚报 high accuracy。
+- Web 采集逻辑位于 `nexartc-cloudPhoneAccess-web/device/src/main.ts`：GPS 最多 1 Hz、约 `0.00003°` 去抖；只要浏览器仍回调有效 fix，相同位置最多去重 5 秒（浏览器停止回调时不会伪造保活）；motion/orientation 最多 10 Hz。
 - GPS 帧的 `bearing` 仍只承载 `GeolocationCoordinates.heading`（运动 course）；设备朝向独立用 sensor type `3` 的 `[azimuth, pitch, roll]` 发送，不再混入 GPS course。
-- `devicemotion` 使用 type `1`（accelerometer），优先无重力 `acceleration`；`deviceorientation` 使用 type `3`，优先 iOS `webkitCompassHeading`，否则转换 absolute alpha 并补偿屏幕旋转。
+- `devicemotion` 使用 type `1`（Android accelerometer 语义），只发送包含重力的 `accelerationIncludingGravity`；`deviceorientation` 使用 type `3`，优先 iOS `webkitCompassHeading`，否则转换 absolute alpha 并补偿屏幕旋转。
 - Connect 用户手势会调用 iOS motion/orientation `requestPermission()`；静态服务设置同源 `Permissions-Policy`。页面进入后台时停止 watch，回到前台且 control channel 仍打开时恢复。
-- `webrtc.ts` 现在等待 DataChannel 的 `open` 事件后才启动采集；control channel 关闭会立即停止 Geolocation 和 sensor listener，消除了首包 race 和断链泄漏。
+- `webrtc.ts` 现在等待 DataChannel 的 `open` 事件后才启动采集；control channel 关闭会立即停止 Geolocation 和 sensor listener。PeerConnection 使用 generation 隔离异步回调，旧 channel 的迟到 close 不会清空新 channel 或误停新会话采集。
 
 ### 2.2 DataChannel 和 CAE
 
@@ -75,9 +75,9 @@ CAE 控制通道在 `CaeConnectionAgent.cpp:924-995` 解析 type 23/24，随后�
 
 本轮已在这一路径增加：
 
-- 外层 `StreamMsgHead` magic、checksum、声明 payload 长度校验；control 通用上限 16 MiB，sensor/location 收紧为 64 KiB；
-- 内层 `MSG_HEADER` 最小长度、声明长度和 optType 校验；
-- sensor/location 共用的单 owner lease：首个发送者持有 30 秒租约，持续发送会续租，断开立即释放，租约超时才允许另一连接接管；owner 新建、接管或释放时通过 JNI 清空上一会话 GPS/compass 缓存；
+- 外层 `StreamMsgHead` magic、checksum、声明 payload 长度与实际帧严格相等校验；control 通用上限 16 MiB，sensor/location 收紧为 64 KiB；
+- 内层 `MSG_HEADER` 最小长度、声明长度、version、devType 和 optType 校验；sensor `devType=0` 仅作为旧客户端兼容输入；
+- sensor/location 共用的单 owner lease：首个发送者持有 30 秒租约，持续发送会续租，断开立即释放，租约超时才允许另一连接接管；owner 校验、JNI 注入、释放/接管 reset 串行化，owner 新建、接管或释放时清空上一会话 GPS/compass 缓存；
 - `VmiDeviceSend()`/`HandleLocationMsg()` 真实返回值传播和 rejected/provider error 日志。
 
 因此 `OnSensorData()`/`OnLocationData()` 不再忽略 `conn_id`。当前 owner 是进程内连接级租约，尚未升级为持久 session id 或带鉴权的业务 owner。
@@ -91,7 +91,9 @@ CAE 控制通道在 `CaeConnectionAgent.cpp:924-995` 解析 type 23/24，随后�
 3. 通过隐藏 `ILocationManager` 添加 `gps`/`network` TestProvider；
 4. 调用 `setTestProviderLocation()`。
 
-GPS 注入和文本解析位于 `VirtualDeviceManager.java`。本轮增加 VMI header/optType、数值范围、finite、最大帧、client timestamp 过期/未来窗口校验；provider 创建与注入失败会返回失败，不再吞错。
+GPS 注入和文本解析位于 `VirtualDeviceManager.java`。本轮增加 VMI header、数值范围、finite、最大帧、client timestamp 过期/未来窗口校验；provider 创建与注入失败会返回失败，不再吞错。Java 的前台注入、后台刷新与 navigation reset 共用状态锁，reset 返回后旧采样不会被刷新线程再次发布。
+
+当前正常前台 GPS 帧只调用 `gps` TestProvider；`network` 仅在显式启用 10 秒 refresh 线程时同步刷新。高德最终读取 gps、network 还是 fused 尚未实测，因此没有在缺少 A/B 证据时强行把正常帧同时写入两个 provider。
 
 Android 后端识别以下 sensor type：
 
@@ -115,7 +117,7 @@ Android 后端识别以下 sensor type：
 
 ### 3.1 P0：方向协议错误——已修复现有 PoC 路径
 
-Web 已停止使用无效 type `0`：线性加速度使用 type `1`，方向使用 type `3`，VMI `devType` 为 `3`。方向 payload 明确定义为 `[azimuth, pitch, roll]`，Android 只消费第一项作为 heading。Web 优先使用 iOS `webkitCompassHeading`；absolute alpha 会转换为顺时针方位角并补偿屏幕旋转。
+Web 已停止使用无效 type `0`：包含重力的加速度使用 type `1`，方向使用 type `3`，VMI `devType` 为 `3`。方向 payload 明确定义为 `[azimuth, pitch, roll]`，Android 只消费第一项作为 heading。Web 优先使用 iOS `webkitCompassHeading`；absolute alpha 会转换为顺时针方位角并补偿屏幕旋转。
 
 剩余限制：type `3` 仍是兼容现有 CAE 的过渡编码，不等价于 Android 原生 orientation sensor；真北/磁北差、厂商浏览器轴定义仍需 Android Chrome 与 iOS Safari 实机校准。若协议继续演进，建议新增显式 `deviceHeading` 字段而不是长期复用原生 sensor type。
 
@@ -132,27 +134,28 @@ Android 后端现在按以下策略选择方向：
 - speed 达到移动阈值时保留 GPS course；
 - 静止/低速时才使用新鲜 device heading；
 - 仅在 `force_gps_bearing=1` 时允许 heading 覆盖移动 course；
-- 浏览器 course 不可用时发送 `-1`，Android 在推导出 course/heading 前不伪造北向 bearing；
+- 浏览器 course 不可用时发送 `-1`；Android 可由连续有效坐标推导 course，在推导出 course/获得 heading 前不伪造北向 bearing；
 - 不再为获得 bearing 强制最小 `3 m/s`，静止 Location 可以只带 bearing 而不伪造速度。
 
 剩余限制是高德是否在静止时采用 `Location.bearing` 尚未实机确认；真正控制其 `SensorManager` 箭头仍需要 framework/HAL 级虚拟传感器。
 
 ### 3.4 P0：刷新、频率和方向更新不足——已修复代码侧节流
 
-当前频率策略为：Web GPS 最多 1 Hz、约 3 m 去抖且最长 5 秒保活；heading/motion 最多 10 Hz；Android provider 最多 1 Hz、移动门槛 1 m。低速/静止 heading 更新会触发最新 GPS Location 的 bearing 刷新，移动时不会覆盖 course。
+当前频率策略为：Web GPS 最多 1 Hz、约 3 m 去抖，浏览器持续回调时相同位置最多抑制 5 秒；heading/motion 最多 10 Hz；Android provider 最多 1 Hz、移动门槛 1 m。低速/静止 heading 更新会触发最新 GPS Location 的 bearing 刷新，移动时不会覆盖 course。
 
-`enable_gps_refresh=0` 现在确实不启动刷新线程，运行时切换也会启停线程。该线程仍以 10 秒做无新客户端数据时的保活/短时 dead reckoning，而正常前台数据走 1 Hz provider 路径。1 Hz 是否为当前高德版本的最佳频率仍需实机性能、路线吸附和耗电测试。
+`enable_gps_refresh=0` 现在确实不启动刷新线程，运行时切换也会启停线程；资产默认仍为 `0`。启用后，该线程以 10 秒做无新客户端数据时的保活/短时 dead reckoning，而正常前台数据走最多 1 Hz 的 gps provider 路径。1 Hz 是否为当前高德版本的最佳频率仍需实机性能、路线吸附和耗电测试。
 
 ### 3.5 P0：错误处理、输入校验和 ACK——输入校验已修复，业务 ACK 待补
 
 已实现：
 
-- 外层 magic/checksum、声明长度、实际长度校验，以及 control 16 MiB、sensor/location 64 KiB 分类型上限；
-- 内层 `MSG_HEADER` 长度/optType 校验，避免短包预读；
+- 外层 magic/checksum、声明长度与实际长度严格相等校验，以及 control 16 MiB、sensor/location 64 KiB 分类型上限；
+- 内层 `MSG_HEADER` 长度/version/devType/optType 校验，避免短包预读和跨设备类型误投；
 - 经纬度、海拔、speed、bearing、accuracy 的 finite/range 校验；
 - GPS client timestamp 旧 120 秒、未来 30 秒窗口校验；
 - sensor type、值数量、finite 和 accuracy 校验；
-- TestProvider 创建、启用、反射注入失败返回；
+- TestProvider 创建、启用、反射注入失败返回；删除时反射优先、shell 回退并检查返回码；
+- JNI byte-array 分配、方法查找、Java 调用异常检查并转为失败，不再让 pending exception 污染后续调用；
 - C++ 传播 `VmiDeviceSend()`/`HandleLocationMsg()` 的实际结果并记录 rejected/provider error；
 - nonroot 继续返回明确的不支持错误。
 
@@ -160,13 +163,13 @@ Android 后端现在按以下策略选择方向：
 
 ### 3.6 P0：多客户端与重连污染——核心覆盖已修复
 
-CAE 已增加进程内单导航 owner lease：首个 sensor/location 发送连接获取 30 秒租约，持续发送续租，其他连接被拒绝；连接断开立即释放，异常断链时租约超时允许接管。owner 创建、接管或释放都会立即清空 Java 侧坐标、速度、bearing、compass、accel/magnet 和计数，避免共享虚拟设备继续刷新上一会话路线；全部虚拟设备关闭时还会恢复原 location mode、Wi-Fi/BLE scan 及 mock_location 设置。
+CAE 已增加进程内单导航 owner lease：首个 sensor/location 发送连接获取 30 秒租约，持续发送续租，其他连接被拒绝；连接断开立即释放，异常断链时租约超时允许接管。owner 校验到 JNI 注入与释放/接管 reset 共用互斥区；Java reset 又与 provider 刷新/前台注入共用状态锁。owner 创建、接管或释放都会清空坐标、速度、bearing、compass、accel/magnet 和计数，避免旧帧或刷新线程在 reset 后恢复上一会话路线；全部虚拟设备关闭时还会恢复原 location mode、Wi-Fi/BLE scan、mock_location，以及启动时成功读取的 shell/root mock-location AppOps 模式。
 
-剩余限制：owner 仍以 transport `conn_id` 标识，没有持久 session id、用户身份或 UI 上的“申请/释放控制权”反馈；进程崩溃后的外部系统设置恢复仍需 Supervisor 启动清理兜底。
+剩余限制：owner 仍以 transport `conn_id` 标识，没有持久 session id、用户身份或 UI 上的“申请/释放控制权”反馈；已经投递给 Android/高德的最后一个 `Location` 无法撤回，reset 只保证不再从 Java 缓存刷新，需等待其变旧或由新 owner 首包覆盖；进程崩溃后的外部系统设置/AppOps 恢复仍需 Supervisor 启动清理兜底。
 
 ### 3.7 P1：坐标系和高德 provider 语义未定——未修复，必须实机决策
 
-当前代码可选 WGS-84 → GCJ-02，资产配置仍默认开启。Android GPS provider 通常承载 WGS-84，而高德也可能自行转换；未经 A/B 测试直接转换存在二次偏移风险。必须在当前高德版本上对北京/上海/境外点验证：
+当前代码可选 WGS-84 → GCJ-02；本轮已把资产默认值改为关闭，避免在无实测依据时预转换。Android GPS provider 通常承载 WGS-84，而高德也可能自行转换；必须在当前高德版本上对北京/上海/境外点验证：
 
 - 高德实际读取 gps、network 还是 fused；
 - 是否发生二次坐标转换；
@@ -174,7 +177,7 @@ CAE 已增加进程内单导航 owner lease：首个 sensor/location 发送连�
 - 是否接受 TestProvider/mock 标记；
 - gps/network 两个 provider 是否竞争。
 
-在实测结论前，不应把 `enable_gcj02_transform=1` 固化为跨设备生产默认值。
+在实测结论前保持 `enable_gcj02_transform=0`；只有目标 ROM/高德版本的 A/B 结果证明需要预转换时，才对该设备画像启用。
 
 ### 3.8 P1：隐私和权限——默认日志已脱敏，治理待补
 
@@ -250,7 +253,7 @@ versionName: 16.21.0.2010
 - [x] course 与 device heading 分离，不再使用 type `0`。
 - [x] CAE 外层/内层长度、数值、类型和 GPS 时效校验。
 - [x] provider 错误传播、单 owner lease、断开清理和系统设置恢复。
-- [x] 1 Hz GPS/provider、10 Hz heading，以及静止 heading 的 Location bearing 刷新。
+- [x] GPS/provider 最多 1 Hz、10 Hz heading，以及静止 heading 的 Location bearing 刷新。
 - [x] 普通日志默认移除精确 GPS/sensor 数据。
 - [ ] UI 明确显示 nonroot 不支持系统 GPS mock。
 - [ ] 浏览器 wire ACK、sequence/session id 和 owner 冲突反馈。
@@ -282,10 +285,12 @@ npm run build
 
 cd ../../nexartc-cloud-phone-access-engine
 ./gradlew :app:externalNativeBuildRootDebug \
-  :app:compileRootDebugJavaWithJavac --no-daemon --console=plain
+  :app:compileRootDebugJavaWithJavac \
+  :app:compileNonrootDebugJavaWithJavac \
+  --no-daemon --console=plain
 ```
 
-三项均成功；C++/Java 构建仅出现既有依赖与 deprecated API warning。Web 与 engine 子仓库 `git diff --check` 通过。
+Web device、Web server、root C++、root Java、nonroot Java 均成功；C++/Java 构建仅出现既有依赖与 deprecated API warning。本任务相关文件的 `git diff --check` 通过。
 
 ## 8. 实机验收清单
 

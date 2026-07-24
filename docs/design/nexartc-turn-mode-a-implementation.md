@@ -446,6 +446,9 @@ export function buildIceServers(turnHost: string, username: string, credential: 
 | **P1-a 短期** | 固定 `STREAM_TOKEN`（环境变量）；客户端 Header `Authorization: Bearer <STREAM_TOKEN>`；`userId` 用 token hash 前缀或 query `clientId`（仅调试） |
 | **P1-b 目标** | 真正登录 JWT，`sub`/`userId` 写入 TURN username（§7.1） |
 
+生产级「安装 App → 平台注册身份 → 有效期/套餐 → 才可被访问」见独立设计：  
+[`nexartc-user-auth-management-platform-design.md`](./nexartc-user-auth-management-platform-design.md)（UMP 控制面 + Hub 执行面）。
+
 **禁止**：把 `TURN_SECRET` 下发到 `device/`。
 
 #### 1.3 验收
