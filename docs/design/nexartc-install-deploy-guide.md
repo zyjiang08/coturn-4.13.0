@@ -7,6 +7,7 @@
 > - [`nexartc-turn-mode-a-vps-deployment.md`](./nexartc-turn-mode-a-vps-deployment.md)（VPS 验收记录）  
 > - [`cae-stun-public-ip-discovery.md`](./cae-stun-public-ip-discovery.md)（STUN 动态公网 IP）  
 > - [`nexartc-logging-design.md`](./nexartc-logging-design.md)（**日志路径、四类前缀、分析排障**）
+> - [`nexartc-web-gps-sensor-amap-navigation-assessment.md`](./nexartc-web-gps-sensor-amap-navigation-assessment.md)（Web GPS/方向传感器、CAE 注入与高德导航评估）
 
 本文说明 **编译 → 产物路径 → 安装 → 配置 → 测试 URL → 日志定位** 的完整闭环。当前生产拓扑以 **VPS `120.79.21.28` / `www.signalling-nexartc.cn`** 为准。  
 日志路径与分析设计以 [`nexartc-logging-design.md`](./nexartc-logging-design.md) 为准；§8 为运维速查副本。
@@ -489,6 +490,8 @@ CAE **默认即详细日志**，无需额外 verbose 开关。排障优先拉 **
 |------|------|------|
 | 文件日志 | `/data/local/tmp/cae/logs/cae_server_*.log` | 主路径；轮转约 4×2MB |
 | Crash | 同目录 `cae_crash.log` / `cae_signal.log` | `[EXC] CRASH` + backtrace |
+| **事故快照** | `/data/local/tmp/cae/logs/incidents/` | Supervisor/Service **重启前**冻结的现场（设计见 supervisor §11 / logging §2.6） |
+| stdout 尾 | `/data/local/tmp/cae/run/cae_stdout.log` | Root 拉起捕获；可含 `Pure virtual` |
 | logcat | tag `CAE` | 实时：`adb logcat -s CAE` |
 | 应用私有 | `/data/user/0/com.nexartc.cloudapp/files/cae/logs/` | 视启动路径而定 |
 
@@ -506,6 +509,10 @@ adb -s "$SERIAL" shell "su -c '
   LOG=\$(ls -t /data/local/tmp/cae/logs/cae_server_*.log | head -1)
   grep -E \"\\[FLOW\\]|\\[FUNC\\]|\\[STAB\\]|\\[EXC\\]|ice_mode|candidate sent|Connected|TURN REST|OnReady\" \$LOG | tail -80
 '"
+
+# 异常自愈后：拉事故快照（重启前现场）
+adb -s "$SERIAL" shell "su -c 'ls -lt /data/local/tmp/cae/logs/incidents | head -10'"
+adb -s "$SERIAL" pull /data/local/tmp/cae/logs/incidents/ ./cae_incidents/
 ```
 
 | 日志关键字 | 含义 |

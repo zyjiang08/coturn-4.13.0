@@ -11,7 +11,8 @@
 
 配套理论与算法细节仍以 `turn-rest-api-signaling.md` 为准；本文只写 **与现有代码如何对接、改什么、按什么顺序上线**。  
 **日志路径、四类前缀与排障分析**见 [`nexartc-logging-design.md`](./nexartc-logging-design.md)。  
-若需要补一层 **CAE 异常自愈 / 远程运维**，请同时参考 [`cae-supervisor-remote-admin-design.md`](./cae-supervisor-remote-admin-design.md)。
+若需要补一层 **CAE 异常自愈 / 远程运维**，请同时参考 [`cae-supervisor-remote-admin-design.md`](./cae-supervisor-remote-admin-design.md)。  
+产品视野（云手机之上的低延迟平台与多场景拓展）见 [`nexartc-low-latency-platform-vision.md`](./nexartc-low-latency-platform-vision.md)。
 
 **可以先本地验证，再迁到 VPS。** 云手机固定在家庭内网；浏览器页面推荐随 Hub 部署（本地或 VPS），用户用手机/电脑打开该 URL。详见 [§0 部署位置与本地→VPS 验证路径](#0-部署位置与本地vps-验证路径)。
 

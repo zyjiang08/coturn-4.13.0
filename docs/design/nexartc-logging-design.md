@@ -29,7 +29,7 @@ flowchart LR
     CoturnF["/var/log/nexartc/coturn.log"]
   end
   subgraph home [家庭内网 Android]
-    CAE["cae_server_*.log / cae_crash.log"]
+    CAE["cae_server_*.log / cae_crash.log / incidents/"]
   end
   subgraph browser [用户浏览器]
     Device["device 面板 / 导出 .log"]
@@ -52,7 +52,7 @@ flowchart LR
 | **coturn** | VPS | **journald** `nexartc-coturn` | **文件** `/var/log/nexartc/coturn.log` | logrotate 日切 14 天 / `maxsize 50M` |
 | **Signal Hub** | VPS | `/opt/nexartc/hub/server/logs/serve_https_{1..N}.log` | `journalctl -u nexartc-hub` | 约 4×2MB 环形 |
 | **device 页** | 浏览器 | 页内 `#logContent` 面板 | DevTools Console；「复制 / 导出」下载 `nexartc-device-*.log` | 内存环约 5000 行 |
-| **CAE** | Android | `/data/local/tmp/cae/logs/cae_server_{1..N}.log` | logcat tag `CAE`；crash：`…/logs/cae_crash.log` + `cae_signal.log` | ini 可配，默认 4×2MB |
+| **CAE** | Android | `/data/local/tmp/cae/logs/cae_server_{1..N}.log` | logcat tag `CAE`；crash：`…/logs/cae_crash.log` + `cae_signal.log`；**事故快照**：`…/logs/incidents/` | ini 可配，默认 4×2MB；incident 默认保留 10 次 / 64MB |
 
 本地验证临时路径（非生产）：coturn `/tmp/coturn-local/`；Hub `/tmp/hub-local/`（见 `test/turn/start_local_env.sh`）。
 
@@ -97,12 +97,62 @@ grep -E '\[FLOW\]|\[FUNC\]|\[EXC\]|auth success|ALLOCATE success' /var/log/nexar
 |------|-------------|
 | 轮转文件 | `/data/local/tmp/cae/logs/cae_server_*.log`（`[log] log_dir` 可改） |
 | Crash | 同目录 `cae_crash.log`；兼容 `cae_signal.log`；轮转文件内有 `[EXC] CRASH` 标记 |
+| stdout 尾 | `/data/local/tmp/cae/run/cae_stdout.log`（Root 拉起时捕获；可含 `Pure virtual`） |
+| liveness | `/data/local/tmp/cae/run/liveness.json`（Supervisor 看门狗；重启后会被新 Worker 覆写） |
+| **事故快照** | `/data/local/tmp/cae/logs/incidents/<YYYYMMDD_HHMMSS_reason_pid>/` — 见 §2.6 |
 | logcat | `adb logcat -s CAE`（环缓可能丢历史，**排障优先拉文件**） |
 | Flush | `LOGE_FLUSH` / `LOGW_FLUSH` / 关键 FLOW 节点 `ForceFlush` |
 
 ```bash
 adb pull /data/local/tmp/cae/logs/ ./cae_logs/
 adb shell "su -c 'ls -lt /data/local/tmp/cae/logs/'"
+```
+
+### 2.6 CAE 异常重启前事故快照（Incident Snapshot）
+
+> 设计真源：[`cae-supervisor-remote-admin-design.md`](./cae-supervisor-remote-admin-design.md) **§11**。  
+> 目的：Supervisor / Service 在 **kill + 拉起之前** 冻结现场，避免轮转与 `cae_stdout` 被新会话覆盖导致无法复盘。
+
+**目录：**
+
+```text
+/data/local/tmp/cae/logs/incidents/
+  20260724_085657_liveness_stale_ageMs_45000_4683/
+    meta.json
+    reason.txt
+    liveness.json
+    cae_crash.log
+    cae_stdout.log
+    cae_server_latest.log
+    cae_server_prev.log          # 可选
+    logcat_cae_tail.txt          # 可选
+```
+
+**触发（摘要）：** `restartCae(*)`、Service health 发现引擎已死并准备重启、Hub/admin 远程 `restart_cae`。  
+**不触发：** cooldown skip、冷启动无旧进程、liveness 健康仅 skip start。
+
+**时序：** `archiveIncident` → 删 liveness / pkill → `ensureCaeStarted`（禁止先杀后拷）。
+
+**配额（ini）：**
+
+```ini
+supervisor_incident_enabled=1
+supervisor_incident_keep_count=10
+supervisor_incident_max_total_mb=64
+```
+
+**拉取与快速分析：**
+
+```bash
+SERIAL=<adb_serial>
+adb -s "$SERIAL" shell "su -c 'ls -lt /data/local/tmp/cae/logs/incidents | head -20'"
+adb -s "$SERIAL" pull /data/local/tmp/cae/logs/incidents/ ./cae_incidents/
+
+# 最近一次
+LATEST=$(ls -td ./cae_incidents/*/ 2>/dev/null | head -1)
+cat "$LATEST/meta.json"
+grep -E '\[EXC\]|\[STAB\]|Pure virtual|Track is not|FATAL|SIG' \
+  "$LATEST"/cae_server_latest.log "$LATEST"/cae_crash.log "$LATEST"/cae_stdout.log 2>/dev/null | tail -80
 ```
 
 ---
@@ -155,7 +205,7 @@ adb shell "su -c 'ls -lt /data/local/tmp/cae/logs/'"
 | ICE failed | device 导出 + CAE | `[EXC] ICE` / `path FAILED` / ICE diagnostics dump | p2p hairpin；应用 hybrid/relay |
 | Connected 无画面 | device Stats + CAE | `[STAB] video health decoded=0` / `sendFrame` / `PLI` | 丢包/码率；非信令问题 |
 | 触控无效 | device + CAE | `[EXC] sendDC SKIP` / `[EXC] HandleTouchMsg` | DC 未 open；注入权限 |
-| CAE 进程消失 | `cae_crash.log` | `[EXC] CRASH` + Backtrace | 对照符号 / 断连析构 |
+| CAE 进程消失 / 被 Supervisor 重启 | `logs/incidents/<最新>/` + `cae_crash.log` | `meta.reason`；`Pure virtual` / `Track is not open`；`[EXC] CRASH` | 先看事故快照再对照符号 / 断连析构 |
 | coturn 中继异常 | `/var/log/nexartc/coturn.log` | `ALLOCATE` / `auth` / usage | `relay-ip`/`external-ip`；安全组 UDP |
 
 ### 5.1 推荐排障顺序
@@ -167,6 +217,7 @@ adb shell "su -c 'ls -lt /data/local/tmp/cae/logs/'"
 4. 若需 TURN：coturn [FUNC] auth success + [FLOW] ALLOCATE success
 5. 媒体：CAE sendFrame vs device decoded / [STAB] video health
 6. crash：cae_crash.log
+7. 若发生过自愈重启：logs/incidents/<最新>/meta.json + 同目录副本
 ```
 
 ### 5.2 一键命令包（开发机）
@@ -206,7 +257,8 @@ device：打开日志面板，搜 `[FLOW]` / `ICE path` / `[EXC]`，必要时「
 | [`nexartc-turn-mode-a-vps-deployment.md`](./nexartc-turn-mode-a-vps-deployment.md) | VPS 运维速查链到本文 |
 | [`turn-rest-api-signaling.md`](./turn-rest-api-signaling.md) | §13.11 运维排障与日志建议与本文对齐 |
 | [`cae-stun-public-ip-discovery.md`](./cae-stun-public-ip-discovery.md) | STUN 公网 IP；联调时对照 CAE candidate / device `ICE path` |
-| [`cae-supervisor-remote-admin-design.md`](./cae-supervisor-remote-admin-design.md) | 自愈监控；crash 日志对齐 `cae_crash.log` / `[EXC] CRASH` |
+| [`cae-supervisor-remote-admin-design.md`](./cae-supervisor-remote-admin-design.md) | 自愈监控；**§11 异常重启前 Incident Snapshot**；crash 对齐 `cae_crash.log` / `[EXC] CRASH` |
+| [`nexartc-cae-session-teardown-stress-test-design.md`](./nexartc-cae-session-teardown-stress-test-design.md) | 多用户上下线 / teardown 压测；失败时对照 abort 签名与 `incidents/` |
 
 ---
 
@@ -215,3 +267,4 @@ device：打开日志面板，搜 `[FLOW]` / `ICE path` / `[EXC]`，必要时「
 | 日期 | 说明 |
 |------|------|
 | 2026-07-21 | 首版：路径总表、coturn journald+文件双写、四类前缀、成功时间线与排障矩阵 |
+| 2026-07-24 | 新增 §2.6：Supervisor/Service 异常重启前事故快照目录、触发时序、配额与 pull 命令；排障表增加 incidents |
