@@ -6,6 +6,7 @@
 >
 > 前置文档：
 > - [`nexartc-cae-scene-change-blur-qp-design.md`](./nexartc-cae-scene-change-blur-qp-design.md)（Phase 0/1：QP 地板、REMB 下限、场景 boost + IDR）
+> - [`nexartc-scene-cut-desktop-blur-optimization.md`](./nexartc-scene-cut-desktop-blur-optimization.md)（CBR/VBR/CQ 场景突变专家分析与优化建议）
 > - [`nexartc-web-cae-h265-support-design.md`](./nexartc-web-cae-h265-support-design.md)（H.265 协商与共享编码器锁）
 
 ---
@@ -18,7 +19,7 @@
 
 1. **修复前台监测阻断点**（本轮已修）：root `app_process` 中 `ActivityThread.currentApplication()` 返回 `null`，导致前台任务监测线程从未启动。系统级 Home/App 切换（用户点手机屏内导航栏或手势）完全没有触发 boost + IDR，只能等浏览器 PLI（滞后 4~9 秒）。这是残余模糊的**主要原因**，不是码率不够。
 2. **H.265 专用 QP 地板**（本轮已加）：现有 `qp_i_max=30 / qp_p_max=34` 按 H.264 调优。HEVC 同 QP 主观质量≈H.264，但同码率下可以负担**更低的 QP**；沿用 H.264 的上限等于浪费了 HEVC 的压缩效率。新增 `qp_i_max_h265=28 / qp_p_max_h265=32`，用效率换清晰度而不是加码率。
-3. **boost 窗口码率上调，稳态不动**（2026-07-24 00:11 更新）：真机日志（§9.1）发现 REMB 稳态爬到 3.6~4.4M 后，boost 封顶 3.5M 低于 REMB，boost 退化为"仅 IDR、零加码"。修复分两步：(a) boost 目标加相对余量下限 **REMB×1.35**；(b) 绝对封顶 `scene_change_boost_bitrate` 3.5M→**4.5M**。仍受 2×REMB 与 `remb_max=6M` 约束、只持续 1.5s、有 2s REMB 恢复地板兜底——与上一轮"固定 5M 冲高翻车"的区别是额外码率**相对、短窗口、有恢复保护**。稳态码率（`override_bitrate`/`remb_max`）保持不动。
+3. **boost 窗口码率上调，稳态不动**（2026-07-24 更新）：真机日志（§9.1）发现 REMB 稳态爬到 3.6~4.4M 后，boost 封顶低于 REMB 时会退化成"仅 IDR、零加码"。当前策略：相对下限 **REMB×2**，绝对封顶 `scene_change_boost_bitrate` 与 `remb_max` 对齐（默认 6M），窗口 1.5s + 2s recovery hold。稳态码率不动。码率模式见 `bitrate_mode=cbr|vbr|cq`（[`nexartc-scene-cut-desktop-blur-optimization.md`](./nexartc-scene-cut-desktop-blur-optimization.md)）。
 
 **编码格式与分辨率可配置**（本轮已实现）：Web 设置页新增 Video Codec（Auto/H.264/H.265）与 Resolution（仅显示 `720p` / `480p` / `360p` 标签，不显示具体宽高）。分辨率映射在协议层携带：720p→720×1560、480p→536×1160、360p→360×780。
 
@@ -81,7 +82,7 @@ WebRTC quality boost: reason=home_key target=3500 kbps ...
 | 提高 `remb_max_bitrate` | ❌ 无效 | 瓶颈不在上限（6M 从未打满） |
 | 提高 `remb_min_bitrate` (>1.5M) | ⏸ 观望 | 1.5M 已保底；再抬影响弱网。仅当日志显示 REMB 长期贴 1.5M 且模糊同窗出现才考虑 2M |
 | 提高 `scene_change_boost_bitrate` (3.5→4.5M) | ✅ 已做 | 只影响 1.5s 窗口，是"提高码率"的正确位置；配合相对余量下限一起生效 |
-| boost 相对余量（REMB×1.35 下限，本轮已加） | ✅ 已做 | 真机日志发现 REMB 超过 3.5M 封顶后 boost 退化为"仅 IDR、零加码"；改为保证切换窗口至少 REMB×1.35（见 §8.2 步骤 8/9） |
+| boost 相对余量（现为 **REMB×2** 下限） | ✅ 已做 | 曾用 REMB×1.35；现对齐 `scene_change_boost_ratio=2.0`，封顶默认 6M（=remb_max） |
 | H.265 专用 QP 地板 | ✅ 本轮已做 | 用压缩效率换清晰度，零带宽成本 |
 | 修复前台监测 | ✅ 本轮已做 | 让 boost 在切换瞬间（而非 PLI 滞后数秒）生效 |
 
@@ -169,7 +170,7 @@ WebRTC quality boost: reason=home_key target=3500 kbps ...
    - `Foreground monitor using system context` + `Foreground monitor started`
 3. H.265 连接，云机内播视频 → 手机屏内 Home 键回桌面：
    - CAE 1s 内出现 `Foreground scene changed: reason=home_key` → `quality boost` → `requesting IDR` → `Frame ... key=true`
-   - **boost 日志 `target` 必须高于当时 REMB 约 1.35 倍**（如 REMB 4.0M → target≈5400 kbps；若 target==REMB 说明退化修复未生效）
+   - **boost 日志 `target` 必须约等于 min(REMB×2, remb_max)**（如 REMB 3.0M → target≈6.0M；REMB 4.0M → target≈6.0M 触顶；若 target==REMB 说明退化）
    - boost 到期后确认 REMB 未被反压跌向 1.5M（`quality recovery complete` 后应正常爬升）
    - Web 侧桌面文字 2s 内可读，无 PLI 风暴（`pli` 不持续增长）
 4. `QP bounds applied: codec=video/hevc I=[-1,28] P=[-1,32]` 出现且 configure 未降级；
@@ -228,7 +229,7 @@ WebRTC quality boost: reason=home_key target=3500 kbps ...
 | 前台监测 Context：`ActivityTaskManager.getService()` 反射 | ✅ 已部署，已验证 |
 | 前台监测 Context：`getSystemContext()` 回退（双保险） | ⏳ 已编码，待部署 |
 | H.265 专用 QP 地板 28/32 | ⏳ 已编码，待部署 |
-| boost 相对余量下限 REMB×1.35 + 封顶 3.5M→4.5M（修复零加码退化并加量） | ⏳ 已编码，待部署 |
+| boost 相对余量下限 REMB×2 + 封顶对齐 remb_max(6M) | ⏳ 已编码，待部署 |
 | boost 按流分辨率像素比缩放 | ⏳ 已编码，待部署 |
 | Web 设置页 codec / resolution 可配置 | ⏳ 已编码，待部署 |
 

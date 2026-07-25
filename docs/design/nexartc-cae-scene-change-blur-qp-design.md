@@ -7,6 +7,8 @@
 > 适用范围：`nexartc-cloud-phone-access-engine` 屏幕采集编码（H.264 / H.265）+ WebRTC REMB/BWE；浏览器侧低延迟抖动缓冲不在本文主路径
 >
 > 关联文档：
+> - [`nexartc-scene-cut-desktop-blur-optimization.md`](./nexartc-scene-cut-desktop-blur-optimization.md)（CBR/VBR/CQ 场景突变专家分析与优化建议）
+> - [`nexartc-scene-change-blur-phase2-codec-resolution.md`](./nexartc-scene-change-blur-phase2-codec-resolution.md)
 > - [`nexartc-web-cae-h265-support-design.md`](./nexartc-web-cae-h265-support-design.md)
 > - [`nexartc-logging-design.md`](./nexartc-logging-design.md)
 > - [`nexartc-webrtc-ice-udp-mux-logical-separation.md`](./nexartc-webrtc-ice-udp-mux-logical-separation.md)
