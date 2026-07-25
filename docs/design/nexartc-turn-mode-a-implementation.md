@@ -255,10 +255,12 @@ flowchart TB
 
 | 模式 | CAE | 浏览器 | 行为 |
 |------|-----|--------|------|
-| **host**（默认） | 仅发 host；Offer `a=ice-lite`；不挂 TURN；`webrtc_local_ip` 须为真实 wlan0 IP | 默认；`?ice_mode=host` | 依赖局域网或公网 DNAT UDP 50000；详见 [`nexartc-install-deploy-guide.md`](./nexartc-install-deploy-guide.md) |
-| **hybrid** | `force_relay=0`；STUN + TURN；`webrtc_local_ip` + `webrtc_port_range_begin/end` 注入 host；`webrtc_public_ip` 运行时通过 coturn/STUN 探测，不再静态填写 | `?ice_mode=hybrid`；Hub 签发 TURN 作 fallback | ICE 优先 host（50000 端口来自配置文件和路由器映射，公网 IP 由 coturn/STUN 动态发现），host 异常后再走 p2p/srflx，最后用 relay |
-| **relay** | `force_relay=1`；仅发 relay candidate | `?ice_mode=relay` 或 `?force_relay=1` | 始终经 coturn 中转（旧 Mode A 严格策略） |
-| **p2p**（仅调试） | 仍可能 gather relay；浏览器侧会忽略 CAE 的 `typ relay` | `?ice_mode=p2p` 或 `?no_relay=1` | **不拉 TURN 凭据**；仅 STUN + host/srflx；用于验证 NAT 是否允许直连 |
+| **host**（默认） | 仅发 host；Offer `a=ice-lite`；不挂 TURN；`webrtc_local_ip` 须为真实 wlan0 IP | 默认；设置页 / `?ice_mode=host` | 依赖局域网或公网 DNAT UDP 50000；详见 [`nexartc-install-deploy-guide.md`](./nexartc-install-deploy-guide.md) |
+| **hybrid** | STUN + TURN；`webrtc_local_ip` + `webrtc_port_range_begin/end` 注入 host；`webrtc_public_ip` 运行时通过 coturn/STUN 探测 | 设置页 / `?ice_mode=hybrid`；Hub 签发 TURN 作 fallback | ICE 优先 host，再 p2p/srflx，最后 relay |
+| **relay** | 仅发 relay candidate；`TransportPolicy::Relay` | 设置页 / `?ice_mode=relay` 或 `?force_relay=1` | 始终经 coturn 中转 |
+| **p2p** | 挂 STUN、不挂 TURN；丢弃 `typ relay` | 设置页 / `?ice_mode=p2p` 或 `?no_relay=1` | **无 relay 兜底**；用于验证 NAT 是否允许直连 |
+
+**两端对齐**：WebRTC 信令 type=1 请求携带 `ice_mode`，CAE 按**会话**覆盖 `webrtc_ice_mode`（未传则用配置，默认 host）。完整说明见仓库根目录 [`docs/webrtc_ice_modes.md`](../../../docs/webrtc_ice_modes.md)。
 
 配置项：
 
@@ -277,13 +279,16 @@ webrtc_turn_secret=...
 
 `listen_port_h5=50000` 与上面的 `webrtc_port_range_*` 使用同一数字端口；TCP/UDP 可共用 50000。
 
-浏览器 URL：
+浏览器入口：
 
-| 参数 | 模式 | 说明 |
+| 入口 | 模式 | 说明 |
 |------|------|------|
-| （默认） | host | 仅 host 直连；Stats 打印 `ICE path: ... (host\|p2p\|relay)` |
-| `?ice_mode=relay` 或 `?force_relay=1` | relay | 强制浏览器仅 relay |
-| `?ice_mode=p2p` 或 `?no_relay=1` | p2p | 跳过 TURN 凭据；忽略 CAE relay candidate；**无 relay 兜底** |
+| （默认）/ 设置「host」 | host | 仅 host 直连；Stats 打印 `ICE path: ... (host\|p2p\|relay)` |
+| 设置「hybrid」或 `?ice_mode=hybrid` | hybrid | 直连优先 + TURN 兜底 |
+| 设置「relay」或 `?ice_mode=relay` / `?force_relay=1` | relay | 强制仅 relay |
+| 设置「p2p」或 `?ice_mode=p2p` / `?no_relay=1` | p2p | 跳过 TURN；**无 relay 兜底** |
+
+URL 查询参数优先于设置页 / localStorage。
 
 **device 页加载建议**：生产调试优先 `https://120.79.21.28/device/`（bundle 最新）；`www.signalling-nexartc.cn/device/` 在部分网络/自动化 curl 下可能超时或缓存旧 JS——以页面日志是否出现 `ICE 模式: p2p` / `mode=hybrid` 为准，并 **Ctrl+Shift+R** 硬刷新。
 

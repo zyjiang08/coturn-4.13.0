@@ -8,6 +8,7 @@
 > - [`cae-stun-public-ip-discovery.md`](./cae-stun-public-ip-discovery.md)（STUN 动态公网 IP）  
 > - [`nexartc-logging-design.md`](./nexartc-logging-design.md)（**日志路径、四类前缀、分析排障**）
 > - [`nexartc-web-gps-sensor-amap-navigation-assessment.md`](./nexartc-web-gps-sensor-amap-navigation-assessment.md)（Web GPS/方向传感器、CAE 注入与高德导航评估）
+> - [`../../../docs/cae_root_nonroot_deployment_guide.md`](../../../docs/cae_root_nonroot_deployment_guide.md)（**CAE Root / Non-root 安装配置部署启动**）
 
 本文说明 **编译 → 产物路径 → 安装 → 配置 → 测试 URL → 日志定位** 的完整闭环。当前生产拓扑以 **VPS `120.79.21.28` / `www.signalling-nexartc.cn`** 为准。  
 日志路径与分析设计以 [`nexartc-logging-design.md`](./nexartc-logging-design.md) 为准；§8 为运维速查副本。
@@ -467,12 +468,14 @@ adb shell "su -c 'sed -i \"s/^webrtc_local_ip=.*/webrtc_local_ip=192.168.124.101
 
 #### 5.4.2 ICE 模式说明
 
-| `webrtc_ice_mode` | CAE 行为 | 浏览器默认 / URL |
-|-------------------|----------|------------------|
-| **host**（默认） | 仅发 host；Offer 带 `a=ice-lite`；不挂 TURN | 默认；可 `&ice_mode=host` |
-| **hybrid** | host/srflx + TURN fallback | `&ice_mode=hybrid` |
-| **p2p** | 不上报 relay（调试） | `&ice_mode=p2p` |
-| **relay** | 仅 relay | `&ice_mode=relay` 或 `&force_relay=1` |
+| `webrtc_ice_mode` | CAE 行为 | 浏览器默认 / 设置 / URL |
+|-------------------|----------|-------------------------|
+| **host**（默认） | 仅发 host；Offer 带 `a=ice-lite`；不挂 TURN | 默认；设置「host」；可 `&ice_mode=host` |
+| **hybrid** | host/srflx + TURN fallback | 设置「hybrid」；`&ice_mode=hybrid` |
+| **p2p** | 不上报 relay | 设置「p2p」；`&ice_mode=p2p` |
+| **relay** | 仅 relay | 设置「relay」；`&ice_mode=relay` 或 `&force_relay=1` |
+
+Web 请求 JSON 的 `ice_mode` 会按会话覆盖 CAE 配置（未传则用上表配置，默认 host）。详见仓库 [`docs/webrtc_ice_modes.md`](../../../docs/webrtc_ice_modes.md)。
 
 路由器若要测 **公网 host**：需 DNAT **UDP 50000** → 手机；映射端口必须与 `webrtc_port_range_*` 一致，否则不注入公网 host（见 STUN 设计文档）。
 
