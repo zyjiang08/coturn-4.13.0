@@ -260,7 +260,7 @@ flowchart TB
 | **relay** | 仅发 relay candidate；`TransportPolicy::Relay` | 设置页 / `?ice_mode=relay` 或 `?force_relay=1` | 始终经 coturn 中转 |
 | **p2p** | 挂 STUN、不挂 TURN；丢弃 `typ relay` | 设置页 / `?ice_mode=p2p` 或 `?no_relay=1` | **无 relay 兜底**；用于验证 NAT 是否允许直连 |
 
-**两端对齐**：WebRTC 信令 type=1 请求携带 `ice_mode`，CAE 按**会话**覆盖 `webrtc_ice_mode`（未传则用配置，默认 host）。完整说明见仓库根目录 [`docs/webrtc_ice_modes.md`](../../../docs/webrtc_ice_modes.md)。
+**两端对齐**：WebRTC 信令 type=1 请求携带 `ice_mode`，CAE 按**会话**覆盖 `webrtc_ice_mode`（未传则用配置，默认 host）。完整说明见 [`nexartc-webrtc-ice-modes.md`](./nexartc-webrtc-ice-modes.md)。
 
 配置项：
 
@@ -453,6 +453,8 @@ export function buildIceServers(turnHost: string, username: string, credential: 
 
 生产级「安装 App → 平台注册身份 → 有效期/套餐 → 才可被访问」见独立设计：  
 [`nexartc-user-auth-management-platform-design.md`](./nexartc-user-auth-management-platform-design.md)（UMP 控制面 + Hub 执行面）。
+
+**观看端 CMS Phase-0（已落地）：** Hub 内嵌 SQLite 用户库 + `/api/cms/v1` + `/cms/`，登录 JWT 约束 TURN / join；测试用户默认 60s 踢线。详见 [`nexartc-cms-user-management-design.md`](./nexartc-cms-user-management-design.md)。生产开启：`CMS_ENFORCE_USERS=1`、`CMS_ALLOW_LEGACY_STREAM_TOKEN=0`。
 
 **禁止**：把 `TURN_SECRET` 下发到 `device/`。
 

@@ -475,7 +475,7 @@ adb shell "su -c 'sed -i \"s/^webrtc_local_ip=.*/webrtc_local_ip=192.168.124.101
 | **p2p** | 不上报 relay | 设置「p2p」；`&ice_mode=p2p` |
 | **relay** | 仅 relay | 设置「relay」；`&ice_mode=relay` 或 `&force_relay=1` |
 
-Web 请求 JSON 的 `ice_mode` 会按会话覆盖 CAE 配置（未传则用上表配置，默认 host）。详见仓库 [`docs/webrtc_ice_modes.md`](../../../docs/webrtc_ice_modes.md)。
+Web 请求 JSON 的 `ice_mode` 会按会话覆盖 CAE 配置（未传则用上表配置，默认 host）。详见 [`nexartc-webrtc-ice-modes.md`](./nexartc-webrtc-ice-modes.md)。
 
 路由器若要测 **公网 host**：需 DNAT **UDP 50000** → 手机；映射端口必须与 `webrtc_port_range_*` 一致，否则不注入公网 host（见 STUN 设计文档）。
 

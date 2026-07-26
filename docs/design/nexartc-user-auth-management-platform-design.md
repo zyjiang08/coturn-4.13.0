@@ -3,6 +3,7 @@
 > 日期：2026-07-24  
 > 状态：设计稿（待评审落地）  
 > 关联：[`nexartc-turn-mode-a-implementation.md`](./nexartc-turn-mode-a-implementation.md)、[`cae-supervisor-remote-admin-design.md`](./cae-supervisor-remote-admin-design.md)、[`nexartc-install-deploy-guide.md`](./nexartc-install-deploy-guide.md)  
+> **Phase-0 CMS（Hub 内嵌用户 CRUD / 测试用户 60s 踢线）**：[`nexartc-cms-user-management-design.md`](./nexartc-cms-user-management-design.md)  
 > 现状基线：Hub 使用共享 `STREAM_TOKEN` / `AGENT_TOKEN`；尚无多租户账号、设备归属与订阅有效期。
 
 ---
@@ -19,6 +20,8 @@
 4. 通过后，设备才可被授权访客 **访问**（Web / 客户端经 Hub 进会话）。
 
 需要建设统一的 **用户管理与鉴权平台（UMP: User Management & Auth Platform）**，替代当前「全环境共享一个 Agent/Stream Token」的联调模式。
+
+**落地次序：** 先实现 [`nexartc-cms-user-management-design.md`](./nexartc-cms-user-management-design.md) 所述 **CMS Phase-0**（观看端注册用户、测试/正式、会话时长、SQLite、Admin CRUD，挂在现有 Hub），再演进到本文的完整 UMP（租户 / 套餐 / 设备凭证）。
 
 ### 1.2 现状缺口
 
@@ -512,6 +515,7 @@ UMP **不替代** non-root 的系统授权；它解决的是 **「谁有权上�
 
 ## 15. 文档维护
 
-- 实现启动后，在 Mode A 实施文档 §1.2「鉴权最小可用方案」增加指向本文的「已由 UMP 替代」说明。  
+- **Phase-0 CMS：** 观看端用户注册 / 测试用户时长等先见 [`nexartc-cms-user-management-design.md`](./nexartc-cms-user-management-design.md)；实现目录建议 `nexartc-cloudPhoneAccess-web/server/src/cms/`。  
+- 实现启动后，在 Mode A 实施文档 §1.2「鉴权最小可用方案」增加指向本文的「已由 UMP 替代」说明；CMS 落地期间注明「观看端鉴权由 CMS Phase-0 约束」。  
 - API 若有 OpenAPI，放置于 `nexartc-cloudPhoneAccess-web/ump/openapi.yaml`（落地时新建，不在本设计强制）。  
 - 密钥与样例环境变量写入 `test/turn/vps/ump.env.example`（落地时新建，**勿提交真实密钥**）。
