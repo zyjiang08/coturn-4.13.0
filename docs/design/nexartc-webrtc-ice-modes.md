@@ -85,8 +85,24 @@ ice_mode=host → 只发 10.24.138.239:50000 typ host
 2. 硬刷新确认 `BUILD_VERSION=20260725B`，日志出现 escalate / TURN。
 3. 无 TURN 配置时只能修 DNAT，或改选不可达。
 
-## 6. 相关文档
+## 6. TURN 落点（设计中，尚未实现）
+
+> 状态：**实现中（未标已支持）**。代码已按 [`nexartc-turn-home-edge-mode-design.md`](./nexartc-turn-home-edge-mode-design.md) 落地骨架；§10 强制 relay 端到端验收完成前，**不能**把 `TURN_SITE=home` 当作已支持配置。默认仍为 `TURN_SITE=vps`。
+
+规划中：`ice_mode` 描述 ICE 策略；正交配置 `turn_site=vps|home`（默认 `vps` = 现网）描述 TURN 落点。
+
+| turn_site | 规划含义 |
+|-----------|----------|
+| `vps`（默认） | 有效 hybrid/relay 使用 VPS coturn（现网，已支持） |
+| `home`（设计中） | 有效 hybrid/relay 使用家宽 Edge coturn；无 DDNS；须 READY 状态机与分 secret |
+
+- **有效 host / 有效 p2p**：不使用 TURN。
+- 若请求 `host` 因 DNAT 不可用 **escalate 为有效 hybrid**，则受 `turn_site` 约束（见家宽 Edge 设计 §2.1）。
+- 完整设计与评审吸收：[`nexartc-turn-home-edge-mode-design.md`](./nexartc-turn-home-edge-mode-design.md)。
+
+## 7. 相关文档
 
 - 部署与联调：[`nexartc-install-deploy-guide.md`](./nexartc-install-deploy-guide.md) §5.4.2
 - Mode A / TURN：[`nexartc-turn-mode-a-implementation.md`](./nexartc-turn-mode-a-implementation.md) §2.2.1
+- 家宽 Edge TURN：[`nexartc-turn-home-edge-mode-design.md`](./nexartc-turn-home-edge-mode-design.md)
 - ICE UDP Mux 多客户端：[`nexartc-webrtc-ice-udp-mux-logical-separation.md`](./nexartc-webrtc-ice-udp-mux-logical-separation.md)

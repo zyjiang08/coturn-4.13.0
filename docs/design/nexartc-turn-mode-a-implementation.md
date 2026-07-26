@@ -7,7 +7,7 @@
 | coturn | `coturn-4.13.0/` | 公网 VPS 上的 STUN/TURN（本地可先自建验证） |
 | 信令 / 静态托管 | `nexartc-cloudPhoneAccess-web/server/` | 升级为 **Signal Hub**（TURN 签发 + Agent 注册 + 信令路由） |
 | 浏览器客户端（页面） | `nexartc-cloudPhoneAccess-web/device/` | SPA 静态资源；固定域名连 Hub；REST 取 TURN 凭据；现有 type 1–5 不变 |
-| 云手机媒体服务 | `nexartc-cloud-phone-access-engine/` | **始终在家庭内网**；出站注册到 Hub；本地生成 TURN 凭据（方案 B）；双端 relay |
+| 云手机媒体服务 | `nexartc-cloud-phone-access-engine/` | **始终在家庭内网**；出站注册到 Hub；现网/`turn_site=vps` 本地 HMAC（方案 B）；`turn_site=home`（设计稿）改为 Hub 会话凭据 |
 
 配套理论与算法细节仍以 `turn-rest-api-signaling.md` 为准；本文只写 **与现有代码如何对接、改什么、按什么顺序上线**。  
 **日志路径、四类前缀与排障分析**见 [`nexartc-logging-design.md`](./nexartc-logging-design.md)。  
@@ -192,7 +192,8 @@ CAE ↔ 浏览器 WebRTC 信令已稳定，**数值 type 1–5** + `CMD_CONTROL`
 Hub **不必**把这些改成文档 §13.4 的字符串 `join`/`signal` 信封给 CAE；推荐：
 
 - **Hub ↔ Mobile / Hub ↔ Agent**：可用 Mode A 控制面消息（register / join / ping）。
-- **会话媒体协商载荷**：Hub **透明转发**现有 `CMD_START` / `CMD_CONTROL(1005)` 二进制帧（或等价的已封装 WebRTC JSON），避免改 CAE 业务层与 `device` 的编解码。
+- **会话媒体协商载荷（VPS 现网 / `turn_site=vps`）**：Hub **透明转发**现有 `CMD_START` / `CMD_CONTROL(1005)` 二进制帧（或等价的已封装 WebRTC JSON）；**type 编号 1–5 不变**。
+- **会话媒体协商载荷（`turn_site=home` 规划路径）**：type 编号仍不变；Hub 在透明转发之外增加**会话控制编排**——校验 type=1 `phase`/`snapshotToken`、冻结/绑定 snapshot、向 CAE 下发 TURN 会话凭据并等待 ACK，然后再允许双端建 PC。详见 [`nexartc-turn-home-edge-mode-design.md`](./nexartc-turn-home-edge-mode-design.md) §5.3。
 
 ---
 
@@ -247,9 +248,11 @@ flowchart TB
 |------|------|------|
 | 信令拓扑 | **Mode A** | 动态 WAN、无 frp/DDNS、手机只认域名 |
 | 浏览器 TURN 凭据 | **方案 A**（Hub 签发） | secret 不下发到 JS |
-| CAE TURN 凭据 | **方案 B**（本地 HMAC） | 无浏览器暴露；与 coturn 同 secret |
+| CAE TURN 凭据 | **方案 B**（本地 HMAC）— **仅 `turn_site=vps` / 现网** | 无浏览器暴露；与 VPS coturn 同 `TURN_SECRET` |
+| CAE TURN（家宽 Edge，规划） | **`turn_site=home` 时 P0 强制 Hub 下发会话凭据**（CAE 不持有 `HOME_TURN_SECRET`） | 见 [`nexartc-turn-home-edge-mode-design.md`](./nexartc-turn-home-edge-mode-design.md) §5.3.3（设计稿） |
 | 媒体策略 | **host（默认）**：仅 host 直连；**hybrid**：host → p2p/srflx → TURN；**relay**：双端仅 TURN | 详见 [`nexartc-install-deploy-guide.md`](./nexartc-install-deploy-guide.md) |
-| 兼容策略 | Hub 透明转发现有 WSS 帧 | 最小改动 CAE Offer/Answer 逻辑 |
+| TURN 落点（规划） | 现网默认 **VPS coturn**（已支持）。**家宽 Edge TURN**（`turn_site=home`）为设计稿，P0 闭环前不可当作已支持 | [`nexartc-turn-home-edge-mode-design.md`](./nexartc-turn-home-edge-mode-design.md)（待实现） |
+| 兼容策略 | **VPS 现网**：Hub 透明转发现有 WSS 帧（type 1–5 不变）。**Home 规划**：同 type 编号上增加会话控制编排（校验 type=1 token、冻结 snapshot、下发 CAE 凭据并等 ACK） | 见 [`nexartc-turn-home-edge-mode-design.md`](./nexartc-turn-home-edge-mode-design.md) §5.3（设计稿） |
 
 #### 2.2.1 ICE 模式 `webrtc_ice_mode`
 
@@ -819,7 +822,7 @@ VPS 开放：80/443（TLS）、3478、5349、49152–65535/udp。
 
 若强制改成字符串 `kind: offer|answer`，需同时改 CAE、`device`、`sdk`、测试页，风险高。
 
-**落地策略**：Mode A 的 **控制面**（register/join）用 JSON；**媒体协商面**透明转发现有帧。文档 §13 的 `signal` JSON 仅作备选，或用于未来非 CAE 媒体节点。
+**落地策略**：Mode A 的 **控制面**（register/join）用 JSON；**媒体协商面**在 VPS 现网路径透明转发现有帧（type 1–5）。`turn_site=home`（设计稿）在相同 type 上增加会话编排，而不是换成 §13 字符串 `signal` 信封。
 
 ### 6.2 信令与媒体分离（不变）
 
@@ -1051,7 +1054,7 @@ Phase 5   多会话 / JWT / 运维
 设计文档本身技术结论正确，可直接作为算法与运维依据。对照本仓库落地时需注意：
 
 1. **§13 示例 Hub 是绿场 Node 服务**；本仓库应 **演进现有 `web/server`**（保留 Admin/静态/ADB），而不是另起无关进程（除非刻意拆分）。
-2. **§13.4 字符串 signal 信封**与现网 **type 1–5 + 二进制帧**不一致；落地应采用本文 §6 的「控制面 JSON + 数据面透明转发」。
+2. **§13.4 字符串 signal 信封**与现网 **type 1–5 + 二进制帧**不一致；落地应采用本文 §6 的「控制面 JSON + VPS 数据面透明转发」；`turn_site=home`（设计稿）在同 type 上叠加会话编排，而非改信封。
 3. **CAE 当前是入站 Offer 方**；Mode A 不改变 Offer/Answer 方向，只改变 WSS 承载路径（经 Agent）。
 4. **现网若手工静态填写 `webrtc_public_ip`** 会与 Mode A「动态发现公网 IP + host 优先」目标冲突；生产应改为 coturn/STUN 动态发现并完成 Phase 4。
 5. **方案 A（浏览器）+ 方案 B（CAE）** 在本场景是正确组合；两端 secret 相同、算法相同即可，无需 CAE 再调 turn-credentials（除非未来不想在设备存 secret）。

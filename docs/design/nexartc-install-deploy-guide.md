@@ -477,6 +477,8 @@ adb shell "su -c 'sed -i \"s/^webrtc_local_ip=.*/webrtc_local_ip=192.168.124.101
 
 Web 请求 JSON 的 `ice_mode` 会按会话覆盖 CAE 配置（未传则用上表配置，默认 host）。详见 [`nexartc-webrtc-ice-modes.md`](./nexartc-webrtc-ice-modes.md)。
 
+**TURN 落点（设计中）：** 现网仅 **`TURN_SITE=vps`（默认）** 为已支持行为。`TURN_SITE=home`（家宽 Edge coturn、无 DDNS、分 secret、READY 状态机）见设计稿 [`nexartc-turn-home-edge-mode-design.md`](./nexartc-turn-home-edge-mode-design.md)；**P0 闭环完成前不要按「已可配置」部署。** 有效 host 不使用 TURN；host escalate 为 hybrid 后的约束见该设计 §2.1。
+
 路由器若要测 **公网 host**：需 DNAT **UDP 50000** → 手机；映射端口必须与 `webrtc_port_range_*` 一致，否则不注入公网 host（见 STUN 设计文档）。
 
 多浏览器同时观看时，CAE 在 `webrtc_enable_udp_mux=1` + `50000-50000` 下走 **ICE UDP Mux 逻辑分离（方案 A）**：底层仍单端口 demux，会话层隔离生命周期。详见 [`nexartc-webrtc-ice-udp-mux-logical-separation.md`](./nexartc-webrtc-ice-udp-mux-logical-separation.md)。
@@ -745,5 +747,6 @@ echo "=== coturn / hub (VPS) ==="
 
 | 日期 | 说明 |
 |------|------|
+| 2026-07-26 | 增加家宽 Edge TURN 设计稿交叉引用（明确尚未实现，勿当已支持） |
 | 2026-07-21 | 关联 [`nexartc-logging-design.md`](./nexartc-logging-design.md)；§8 标明为运维速查副本 |
 | 2026-07-20 | 首版安装部署手册：coturn / Hub / device / CAE；默认 host ICE；日志默认全开说明 |
