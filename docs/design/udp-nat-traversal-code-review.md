@@ -1353,3 +1353,12 @@ go vet ./...
 | Birthday | 一侧多映射、另一侧扫端口，用集合碰撞打洞 |
 | Punch Socket | 实际参与打洞的 UDP socket（应与信令上报的映射一致） |
 | 图片方案 / 设计变体 | 锥侧扫 1024 + 对称侧 256 socket 的外部设计；非 F2P 当前代码 |
+
+## 附录 D · 外部参考文档
+
+下列文章提供 NAT1–NAT4 通俗分类、家宽 NAT 优化与本机测类型方法，可与本文 EIM/Cone、Port-Restricted、Symmetric 术语对照阅读（非正式 IETF 用语，以 RFC 3489/5780 行为定义为准）。
+
+| 标题 | 链接 |
+|------|------|
+| 家庭网络优化指南：提升NAT类型，降低游戏延迟、提高下载速度 | https://blog.17lai.site/posts/9404dba0/ |
+| 是NAT3还是NAT4？使用Mac测试你的网络类型 | https://blog.zhheo.com/p/76f914a8.html |
